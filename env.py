@@ -66,10 +66,10 @@ class DroneInterceptEnv:
         # Randomize target patrol
         self.target_phase = self.rng.uniform(0, 2 * math.pi)
         self.target_alt = self.rng.uniform(80, 250)
-        self.target_speed = self.rng.uniform(60, 150)
+        self.target_speed = self.rng.uniform(120, 260)
         # Patrol bounds: a wide horizontal range
         centre_x = self.rng.uniform(300, WORLD_W - 300)
-        patrol_half = self.rng.uniform(200, 400)
+        patrol_half = self.rng.uniform(400, 600)
         self.patrol_left = centre_x - patrol_half
         self.patrol_right = centre_x + patrol_half
 
