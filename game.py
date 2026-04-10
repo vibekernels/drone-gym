@@ -655,7 +655,7 @@ def run():
         target_alt = random.uniform(80, 250)
         target_speed = random.uniform(120, 260)
         centre_x = random.uniform(300, WIDTH - 300)
-        patrol_half = random.uniform(400, 600)
+        patrol_half = random.uniform(2000, 3000)
         patrol_left = centre_x - patrol_half
         patrol_right = centre_x + patrol_half
         # Start target along the patrol route

@@ -69,7 +69,7 @@ class DroneInterceptEnv:
         self.target_speed = self.rng.uniform(120, 260)
         # Patrol bounds: a wide horizontal range
         centre_x = self.rng.uniform(300, WORLD_W - 300)
-        patrol_half = self.rng.uniform(400, 600)
+        patrol_half = self.rng.uniform(2000, 3000)
         self.patrol_left = centre_x - patrol_half
         self.patrol_right = centre_x + patrol_half
 
