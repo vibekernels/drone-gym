@@ -123,22 +123,26 @@ def draw_drone(surf, state, colour, cam, thrust_on=False):
     pygame.draw.polygon(surf, WHITE, pts, 1)
 
     # Arms + rotors
+    rotor_radius = max(1, int(r * 0.35))
     for side in (-1, 1):
         arm_end_x = side * r * 0.9
         arm_end_y = -r * 0.15
         arm = [(0, -r * 0.15), (arm_end_x, arm_end_y)]
         arm_pts = _rotated_poly(arm, angle, sx, sy)
         pygame.draw.line(surf, WHITE, arm_pts[0], arm_pts[1], max(1, int(2 * cam.zoom)))
-        # Rotor disc
+        # Rotor disc — filled bright when thrusting (spinning), thin outline when idle
         rotor_cx, rotor_cy = _rotated_poly([(arm_end_x, arm_end_y - r * 0.15)], angle, sx, sy)[0]
-        pygame.draw.circle(surf, (*colour, 180), (int(rotor_cx), int(rotor_cy)), max(1, int(r * 0.35)), 1)
-
-    # Thrust flame
-    if thrust_on:
-        flame_len = random.uniform(r * 0.6, r * 1.2)
-        flame = [(- r * 0.15, r * 0.3), (r * 0.15, r * 0.3), (0, r * 0.3 + flame_len)]
-        flame_pts = _rotated_poly(flame, angle, sx, sy)
-        pygame.draw.polygon(surf, THRUST_COL, flame_pts)
+        rcx, rcy = int(rotor_cx), int(rotor_cy)
+        if thrust_on:
+            # Motion-blurred spin: filled disc with a faint outer halo
+            halo_r = rotor_radius + max(1, int(r * 0.1))
+            halo = pygame.Surface((halo_r * 2 + 2, halo_r * 2 + 2), pygame.SRCALPHA)
+            pygame.draw.circle(halo, (*THRUST_COL, 70), (halo_r + 1, halo_r + 1), halo_r)
+            surf.blit(halo, (rcx - halo_r - 1, rcy - halo_r - 1))
+            pygame.draw.circle(surf, THRUST_COL, (rcx, rcy), rotor_radius)
+            pygame.draw.circle(surf, WHITE, (rcx, rcy), rotor_radius, 1)
+        else:
+            pygame.draw.circle(surf, colour, (rcx, rcy), rotor_radius, 1)
 
 
 def draw_stars(surf, stars):
