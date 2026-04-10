@@ -77,8 +77,11 @@ cpdef void player_update_power(double[:] s, double dt,
     if right_power > 1.0:
         right_power = 1.0
 
-    # Differential torque: right > left → rotate right (positive angle = clockwise)
-    s[4] += PLAYER_TURN_POWER * (right_power - left_power) * dt
+    # Differential torque: left rotor alone lifts the left side, pitching the
+    # body clockwise on screen (body-up tilts to the right). Right rotor alone
+    # does the opposite. In rigid-body terms, τ_z = -r·F_right + r·F_left, and
+    # in this coordinate system positive Δangle = clockwise, so:
+    s[4] += PLAYER_TURN_POWER * (left_power - right_power) * dt
 
     # Combined thrust along body-up (angle 0 = up). L=R=1.0 → PLAYER_THRUST_POWER.
     cdef double thrust_mag = (left_power + right_power) * 0.5 * PLAYER_THRUST_POWER
