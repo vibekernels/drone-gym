@@ -5,13 +5,18 @@ Pilot your interceptor drone (arrow keys / WASD) and smash into
 the enemy drone patrolling high above.
 """
 
+import os
 import sys
 import math
 import array
 import random
 
+import numpy as np
+import torch
 import pygame
 import physics  # Cython module
+from policy import DronePolicy
+from env import CAM_WIDTH as AI_CAM_WIDTH, CAM_FOV as AI_CAM_FOV, NUM_FRAMES, WORLD_H
 
 # ── Display ──────────────────────────────────────────────────────────
 WIDTH, HEIGHT = 1024, 768
@@ -38,6 +43,54 @@ def make_state(x, y, radius):
     return array.array("d", [x, y, 0.0, 0.0, 0.0, radius])
 
 
+# ── Dynamic camera ───────────────────────────────────────────────────
+
+class Camera:
+    """Computes a view that keeps both drones on screen with smooth tracking."""
+
+    PADDING = 150       # min pixels of padding around drones on screen
+    MIN_ZOOM = 0.15     # don't zoom out more than this
+    MAX_ZOOM = 1.0      # 1:1 is the closest
+    LERP_SPEED = 3.0    # how fast camera tracks (per second)
+
+    def __init__(self):
+        # Camera centre in world coords and current zoom
+        self.cx = WIDTH / 2
+        self.cy = GROUND_Y / 2
+        self.zoom = 1.0
+
+    def update(self, player, target, dt):
+        """Smoothly track so both drones are visible."""
+        # Desired centre: midpoint of the two drones
+        mid_x = (player[0] + target[0]) / 2
+        mid_y = (player[1] + target[1]) / 2
+
+        # Required span to fit both drones
+        dx = abs(player[0] - target[0]) + self.PADDING * 2
+        dy = abs(player[1] - target[1]) + self.PADDING * 2
+
+        zoom_x = WIDTH / max(dx, 1)
+        zoom_y = GROUND_Y / max(dy, 1)   # only use sky area for framing
+        desired_zoom = min(zoom_x, zoom_y)
+        desired_zoom = max(self.MIN_ZOOM, min(self.MAX_ZOOM, desired_zoom))
+
+        # Smooth interpolation
+        t = min(1.0, self.LERP_SPEED * dt)
+        self.cx += (mid_x - self.cx) * t
+        self.cy += (mid_y - self.cy) * t
+        self.zoom += (desired_zoom - self.zoom) * t
+
+    def world_to_screen(self, wx, wy):
+        """Convert world coordinates to screen pixel coordinates."""
+        sx = (wx - self.cx) * self.zoom + WIDTH / 2
+        sy = (wy - self.cy) * self.zoom + GROUND_Y / 2
+        return sx, sy
+
+    def scale(self, size):
+        """Scale a world-space size to screen pixels."""
+        return size * self.zoom
+
+
 # ── Drawing helpers ──────────────────────────────────────────────────
 
 def draw_gradient_sky(surf):
@@ -56,15 +109,16 @@ def _rotated_poly(points, angle, cx, cy):
     return [(cx + x * ca - y * sa, cy + x * sa + y * ca) for x, y in points]
 
 
-def draw_drone(surf, state, colour, thrust_on=False):
+def draw_drone(surf, state, colour, cam, thrust_on=False):
     """Draw a drone as a stylised quad-copter shape."""
     x, y, vx, vy, angle, radius = state
-    r = radius
+    sx, sy = cam.world_to_screen(x, y)
+    r = cam.scale(radius)
 
     # Body
     body = [(-r * 0.35, -r * 0.6), (r * 0.35, -r * 0.6),
             (r * 0.4, r * 0.3), (-r * 0.4, r * 0.3)]
-    pts = _rotated_poly(body, angle, x, y)
+    pts = _rotated_poly(body, angle, sx, sy)
     pygame.draw.polygon(surf, colour, pts)
     pygame.draw.polygon(surf, WHITE, pts, 1)
 
@@ -73,17 +127,17 @@ def draw_drone(surf, state, colour, thrust_on=False):
         arm_end_x = side * r * 0.9
         arm_end_y = -r * 0.15
         arm = [(0, -r * 0.15), (arm_end_x, arm_end_y)]
-        arm_pts = _rotated_poly(arm, angle, x, y)
-        pygame.draw.line(surf, WHITE, arm_pts[0], arm_pts[1], 2)
+        arm_pts = _rotated_poly(arm, angle, sx, sy)
+        pygame.draw.line(surf, WHITE, arm_pts[0], arm_pts[1], max(1, int(2 * cam.zoom)))
         # Rotor disc
-        rotor_cx, rotor_cy = _rotated_poly([(arm_end_x, arm_end_y - r * 0.15)], angle, x, y)[0]
-        pygame.draw.circle(surf, (*colour, 180), (int(rotor_cx), int(rotor_cy)), int(r * 0.35), 1)
+        rotor_cx, rotor_cy = _rotated_poly([(arm_end_x, arm_end_y - r * 0.15)], angle, sx, sy)[0]
+        pygame.draw.circle(surf, (*colour, 180), (int(rotor_cx), int(rotor_cy)), max(1, int(r * 0.35)), 1)
 
     # Thrust flame
     if thrust_on:
         flame_len = random.uniform(r * 0.6, r * 1.2)
         flame = [(- r * 0.15, r * 0.3), (r * 0.15, r * 0.3), (0, r * 0.3 + flame_len)]
-        flame_pts = _rotated_poly(flame, angle, x, y)
+        flame_pts = _rotated_poly(flame, angle, sx, sy)
         pygame.draw.polygon(surf, THRUST_COL, flame_pts)
 
 
@@ -93,10 +147,22 @@ def draw_stars(surf, stars):
         surf.set_at((sx, sy), (c, c, c))
 
 
-def draw_ground(surf):
-    pygame.draw.rect(surf, GROUND, (0, GROUND_Y, WIDTH, HEIGHT - GROUND_Y))
-    for gx in range(0, WIDTH, 60):
-        pygame.draw.line(surf, GROUND_LINE, (gx, GROUND_Y), (gx + 30, HEIGHT), 1)
+def draw_ground(surf, cam):
+    """Draw the ground plane, accounting for camera."""
+    _, ground_sy = cam.world_to_screen(0, GROUND_Y)
+    ground_sy = int(ground_sy)
+    if ground_sy < HEIGHT:
+        pygame.draw.rect(surf, GROUND, (0, ground_sy, WIDTH, HEIGHT - ground_sy))
+        # Ground hash lines
+        # Figure out world X range visible on screen
+        left_wx = cam.cx - (WIDTH / 2) / cam.zoom
+        right_wx = cam.cx + (WIDTH / 2) / cam.zoom
+        spacing = 60
+        start_gx = int(left_wx // spacing) * spacing
+        for gwx in range(start_gx, int(right_wx) + spacing, spacing):
+            sx1, _ = cam.world_to_screen(gwx, GROUND_Y)
+            sx2, sy2 = cam.world_to_screen(gwx + 30, GROUND_Y + 40)
+            pygame.draw.line(surf, GROUND_LINE, (int(sx1), ground_sy), (int(sx2), int(sy2)), 1)
 
 
 def draw_altimeter(surf, font, player_y):
@@ -249,12 +315,84 @@ class Particle:
         self.y += self.vy * dt
         self.life -= dt
 
-    def draw(self, surf):
+    def draw(self, surf, cam):
         t = self.life / self.max_life
         idx = min(int((1 - t) * len(EXPLOSION_COLS)), len(EXPLOSION_COLS) - 1)
         col = EXPLOSION_COLS[idx]
-        sz = max(1, int(self.size * t))
-        pygame.draw.circle(surf, col, (int(self.x), int(self.y)), sz)
+        sz = max(1, int(cam.scale(self.size) * t))
+        sx, sy = cam.world_to_screen(self.x, self.y)
+        pygame.draw.circle(surf, col, (int(sx), int(sy)), sz)
+
+
+# ── AI autopilot ─────────────────────────────────────────────────────
+
+CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "checkpoints", "policy_final.pt")
+
+
+class Autopilot:
+    """Wraps the trained policy for use inside the game loop."""
+
+    def __init__(self):
+        self.policy = None
+        self.frames = np.zeros((NUM_FRAMES, AI_CAM_WIDTH), dtype=np.float32)
+        self.cam_out = array.array("d", [0.0, 0.0, 0.0])
+        self.last_turn = 1   # 0=left 1=none 2=right
+        self.last_thrust = 0
+
+    def load(self):
+        if self.policy is not None:
+            return True
+        if not os.path.exists(CHECKPOINT_PATH):
+            return False
+        ckpt = torch.load(CHECKPOINT_PATH, map_location="cpu", weights_only=False)
+        self.policy = DronePolicy()
+        self.policy.load_state_dict(ckpt["policy"])
+        self.policy.eval()
+        return True
+
+    def reset(self):
+        self.frames[:] = 0
+        self.last_turn = 1
+        self.last_thrust = 0
+
+    def _render_camera_line(self, player, target):
+        line = np.zeros(AI_CAM_WIDTH, dtype=np.float32)
+        physics.camera_project(player, target, AI_CAM_FOV, AI_CAM_WIDTH, self.cam_out)
+        centre = self.cam_out[0]
+        width = self.cam_out[1]
+        if centre >= 0:
+            dist = physics.distance(player, target)
+            intensity = min(1.0, max(0.2, 200.0 / max(dist, 1.0)))
+            half_w = width / 2.0
+            left = max(0, int(centre - half_w))
+            right = min(AI_CAM_WIDTH, int(centre + half_w) + 1)
+            line[left:right] = intensity
+        return line
+
+    def _get_aux(self, player, target):
+        ang_vel = player[4] / math.pi
+        alt = 1.0 - player[1] / WORLD_H
+        vspeed = -player[3] / 400.0
+        dist = physics.distance(player, target) / 800.0
+        return np.array([ang_vel, alt, vspeed, dist], dtype=np.float32)
+
+    @torch.no_grad()
+    def act(self, player, target):
+        """Return (turn, thrust) where turn is -1/0/+1 and thrust is 0/1."""
+        new_line = self._render_camera_line(player, target)
+        self.frames[:-1] = self.frames[1:]
+        self.frames[-1] = new_line
+
+        cam_t = torch.from_numpy(self.frames).unsqueeze(0)
+        aux_t = torch.from_numpy(self._get_aux(player, target)).unsqueeze(0)
+        a_turn, a_thrust, _, _, _ = self.policy.get_action_and_value(cam_t, aux_t)
+
+        self.last_turn = a_turn.item()
+        self.last_thrust = a_thrust.item()
+        turn = self.last_turn - 1   # 0,1,2 → -1,0,+1
+        thrust = self.last_thrust
+        return turn, thrust
 
 
 # ── Game states ──────────────────────────────────────────────────────
@@ -278,6 +416,13 @@ def run():
     # Stars
     stars = [(random.randint(0, WIDTH), random.randint(0, GROUND_Y - 50),
               random.randint(80, 255)) for _ in range(120)]
+
+    # ── AI autopilot ─────────────────────────────────────────────────
+    autopilot = Autopilot()
+    auto_mode = False
+
+    # ── Dynamic camera ───────────────────────────────────────────────
+    cam = Camera()
 
     # ── State init ───────────────────────────────────────────────────
     game_state = STATE_TITLE
@@ -314,28 +459,41 @@ def run():
             if ev.type == pygame.KEYDOWN:
                 if ev.key == pygame.K_ESCAPE:
                     running = False
+                if ev.key == pygame.K_c:
+                    if auto_mode:
+                        auto_mode = False
+                    elif autopilot.load():
+                        auto_mode = True
+                        autopilot.reset()
                 if game_state == STATE_TITLE and ev.key in (pygame.K_SPACE, pygame.K_RETURN):
                     game_state = STATE_PLAY
                     reset_round()
+                    if auto_mode:
+                        autopilot.reset()
                 if game_state == STATE_HIT and ev.key in (pygame.K_SPACE, pygame.K_RETURN):
                     game_state = STATE_PLAY
                     reset_round()
+                    if auto_mode:
+                        autopilot.reset()
 
         keys = pygame.key.get_pressed()
 
         # ── Update ───────────────────────────────────────────────────
         if game_state == STATE_PLAY:
-            turn = 0
-            thrust = 0
-            if keys[pygame.K_LEFT] or keys[pygame.K_a]:
-                turn = -1
-            if keys[pygame.K_RIGHT] or keys[pygame.K_d]:
-                turn = 1
-            if keys[pygame.K_UP] or keys[pygame.K_w]:
-                thrust = 1
+            if auto_mode:
+                turn, thrust = autopilot.act(player, target)
+            else:
+                turn = 0
+                thrust = 0
+                if keys[pygame.K_LEFT] or keys[pygame.K_a]:
+                    turn = -1
+                if keys[pygame.K_RIGHT] or keys[pygame.K_d]:
+                    turn = 1
+                if keys[pygame.K_UP] or keys[pygame.K_w]:
+                    thrust = 1
 
             physics.player_update(player, dt, turn, thrust)
-            physics.wrap_world(player, float(WIDTH), float(GROUND_Y))
+            physics.clamp_world(player, float(GROUND_Y))
 
             target_phase += orbit_speed * dt
             physics.target_update(target, dt, orbit_cx, orbit_cy,
@@ -359,28 +517,36 @@ def run():
                 p.update(dt)
             particles = [p for p in particles if p.life > 0]
 
+        # ── Update camera ────────────────────────────────────────────
+        if game_state in (STATE_PLAY, STATE_HIT):
+            cam.update(player, target, dt)
+
         # ── Draw ─────────────────────────────────────────────────────
         screen.blit(sky_surf, (0, 0))
         draw_stars(screen, stars)
-        draw_ground(screen)
+        draw_ground(screen, cam)
 
         if game_state == STATE_TITLE:
             title = big_font.render("DRONE INTERCEPT", True, WHITE)
-            sub = font.render("Arrow keys / WASD to fly.  Smash the target drone!", True, HUD_COL)
+            sub = font.render("Arrow keys / WASD to fly.  [C] toggle AI pilot.", True, HUD_COL)
             start = font.render("Press SPACE to launch", True, (255, 255, 100))
             screen.blit(title, (WIDTH // 2 - title.get_width() // 2, HEIGHT // 2 - 60))
             screen.blit(sub, (WIDTH // 2 - sub.get_width() // 2, HEIGHT // 2))
             screen.blit(start, (WIDTH // 2 - start.get_width() // 2, HEIGHT // 2 + 40))
-            # Draw demo drones
+            # Draw demo drones (screen coords, use a static camera)
+            title_cam = Camera()
             draw_drone(screen, make_state(WIDTH // 2 - 100, HEIGHT // 2 - 120, PLAYER_RADIUS),
-                       (0, 180, 255))
+                       (0, 180, 255), title_cam)
             draw_drone(screen, make_state(WIDTH // 2 + 100, HEIGHT // 2 - 120, TARGET_RADIUS),
-                       (255, 60, 60))
+                       (255, 60, 60), title_cam)
 
         elif game_state == STATE_PLAY:
-            thrust_on = keys[pygame.K_UP] or keys[pygame.K_w]
-            draw_drone(screen, target, (255, 60, 60))
-            draw_drone(screen, player, (0, 180, 255), thrust_on)
+            if auto_mode:
+                thrust_on = (thrust == 1)
+            else:
+                thrust_on = keys[pygame.K_UP] or keys[pygame.K_w]
+            draw_drone(screen, target, (255, 60, 60), cam)
+            draw_drone(screen, player, (0, 180, 255), cam, thrust_on)
             draw_altimeter(screen, font, player[1])
             draw_speed(screen, font, player)
             draw_distance_indicator(screen, font, player, target)
@@ -388,10 +554,33 @@ def run():
             score_txt = font.render(f"SCORE {score}", True, HUD_COL)
             screen.blit(score_txt, (WIDTH - score_txt.get_width() - 15, 15))
 
+            # Zoom indicator
+            zoom_txt = font.render(f"ZOOM {cam.zoom:.2f}x", True, (100, 100, 100))
+            screen.blit(zoom_txt, (15, 90))
+
+            if auto_mode:
+                # AI pilot label
+                ai_label = font.render("AI PILOT  [C] manual", True, (255, 255, 100))
+                screen.blit(ai_label, (WIDTH // 2 - ai_label.get_width() // 2, 15))
+                # Show current action
+                actions = []
+                if turn == -1:
+                    actions.append("LEFT")
+                elif turn == 1:
+                    actions.append("RIGHT")
+                if thrust == 1:
+                    actions.append("THRUST")
+                act_str = " + ".join(actions) if actions else "COAST"
+                act_txt = font.render(act_str, True, WHITE)
+                screen.blit(act_txt, (WIDTH // 2 - act_txt.get_width() // 2, 38))
+            else:
+                mode_txt = font.render("[C] auto pilot", True, (100, 100, 100))
+                screen.blit(mode_txt, (WIDTH // 2 - mode_txt.get_width() // 2, 15))
+
         elif game_state == STATE_HIT:
             # Draw drones fading / exploding
             for p in particles:
-                p.draw(screen)
+                p.draw(screen, cam)
             hit_txt = big_font.render(f"HIT!  +{int(physics.relative_speed(player, target) / 2)}",
                                       True, (255, 255, 100))
             screen.blit(hit_txt, (WIDTH // 2 - hit_txt.get_width() // 2, HEIGHT // 2 - 30))

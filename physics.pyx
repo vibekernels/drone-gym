@@ -146,12 +146,8 @@ cpdef void camera_project(double[:] player, double[:] target,
         out[1] = 1.0
 
 
-cpdef void wrap_world(double[:] s, double w, double h) noexcept:
-    """Wrap drone horizontally; clamp vertically with bounce."""
-    if s[0] < 0:
-        s[0] += w
-    elif s[0] > w:
-        s[0] -= w
+cpdef void clamp_world(double[:] s, double h) noexcept:
+    """Clamp drone vertically: bounce off ground, soft ceiling. No horizontal wrap."""
     if s[1] > h:
         s[1] = h
         s[3] = -fabs(s[3]) * 0.3  # gentle bounce off ground
