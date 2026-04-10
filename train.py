@@ -88,8 +88,12 @@ def compute_gae(rewards, values, dones, next_value, gamma, gae_lambda):
 
 def train():
     args = parse_args()
-    # MPS has too much per-op overhead for this tiny model; only use CUDA
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Device: {device}")
 
     torch.manual_seed(args.seed)

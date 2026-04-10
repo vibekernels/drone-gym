@@ -43,7 +43,7 @@ python setup.py build_ext --inplace
 # Play the game
 python game.py
 
-# Train a new model (~22 min on CPU)
+# Train a new model (~9 min on Apple Silicon MPS, ~22 min on CPU)
 python train.py --num-envs 64 --horizon 128 --total-timesteps 2000000 --ent-coef 0.02
 
 # Watch a trained model play
@@ -52,12 +52,11 @@ python enjoy.py checkpoints/policy_final.pt
 
 ## Evaluation
 
-Trained for 2M steps (~22 min on Apple M-series CPU):
+Trained for 2M steps (~9 min on Apple M1 Max via MPS, 3600 SPS):
 
 | Metric | Value |
 |---|---|
-| Hit rate | 100% (200/200) |
-| Median intercept time | 4.3s |
-| Fastest intercept | 2.8s |
-| Mean return | 48.77 +/- 0.45 |
-| Timeouts | 0% |
+| Hit rate | 99.5% (199/200) |
+| Median intercept time | 3.4s |
+| Fastest intercept | 2.6s |
+| Timeouts | 0.5% (1/200) |
