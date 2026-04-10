@@ -53,11 +53,15 @@ def make_state(x, y, radius):
 class Camera:
     """Computes a view that keeps both drones AND the ground on screen."""
 
-    PADDING = 150       # min pixels of padding around drones on screen
-    GROUND_MARGIN = 40  # screen-space margin kept below the ground line
-    MIN_ZOOM = 0.12     # don't zoom out more than this
-    MAX_ZOOM = 1.0      # 1:1 is the closest
-    LERP_SPEED = 3.0    # how fast camera tracks (per second)
+    PADDING = 150        # min world-space padding around drones
+    GROUND_MARGIN = 40   # world-space margin kept below the ground line
+    MIN_ZOOM = 0.12      # don't zoom out more than this
+    MAX_ZOOM = 1.0       # 1:1 is the closest
+    CENTER_LERP = 5.0    # centre-tracking speed
+    ZOOM_OUT_LERP = 12.0 # fast zoom out so we don't lose a sprinting drone
+    ZOOM_IN_LERP = 2.0   # gentle zoom in — purely cosmetic
+    LOOKAHEAD = 0.35     # seconds of velocity projection for anticipation
+    SAFETY_MARGIN = 25   # screen pixels — hard clamp keeps drones in this box
 
     def __init__(self):
         # Camera centre in world coords and current zoom
@@ -65,30 +69,86 @@ class Camera:
         self.cy = GROUND_Y - 200
         self.zoom = 1.0
 
+    def _framing_box(self, player, target):
+        """Return (mid_x, mid_y, dx, dy) of the world-space region to frame.
+
+        Expands the bounding box to include both drones' predicted
+        positions `LOOKAHEAD` seconds from now, so the camera starts
+        zooming out before a fast drone reaches the edge.
+        """
+        px, py, pvx, pvy = player[0], player[1], player[2], player[3]
+        tx, ty, tvx, tvy = target[0], target[1], target[2], target[3]
+        fp_x = px + pvx * self.LOOKAHEAD
+        fp_y = py + pvy * self.LOOKAHEAD
+        ft_x = tx + tvx * self.LOOKAHEAD
+        ft_y = ty + tvy * self.LOOKAHEAD
+
+        min_x = min(px, tx, fp_x, ft_x)
+        max_x = max(px, tx, fp_x, ft_x)
+        # Vertical framing: include both drones AND the ground.
+        top_y = min(py, ty, fp_y, ft_y) - self.PADDING
+        bot_y = GROUND_Y + self.GROUND_MARGIN
+
+        mid_x = (min_x + max_x) / 2
+        mid_y = (top_y + bot_y) / 2
+        dx = (max_x - min_x) + self.PADDING * 2
+        dy = bot_y - top_y
+        return mid_x, mid_y, dx, dy
+
     def update(self, player, target, dt):
         """Smoothly track so both drones and the ground stay visible."""
-        mid_x = (player[0] + target[0]) / 2
-
-        # Vertical framing: from the higher drone's top all the way down
-        # to the ground, with a small margin below so the ground line
-        # is never flush with the bottom of the screen.
-        top_y = min(player[1], target[1]) - self.PADDING
-        bot_y = GROUND_Y + self.GROUND_MARGIN
-        mid_y = (top_y + bot_y) / 2
-
-        dx = abs(player[0] - target[0]) + self.PADDING * 2
-        dy = bot_y - top_y
+        mid_x, mid_y, dx, dy = self._framing_box(player, target)
 
         zoom_x = WIDTH / max(dx, 1)
         zoom_y = HEIGHT / max(dy, 1)
         desired_zoom = min(zoom_x, zoom_y)
         desired_zoom = max(self.MIN_ZOOM, min(self.MAX_ZOOM, desired_zoom))
 
-        # Smooth interpolation
-        t = min(1.0, self.LERP_SPEED * dt)
-        self.cx += (mid_x - self.cx) * t
-        self.cy += (mid_y - self.cy) * t
-        self.zoom += (desired_zoom - self.zoom) * t
+        # Asymmetric zoom: fast out (safety), slow in (cosmetic).
+        zoom_speed = (self.ZOOM_OUT_LERP if desired_zoom < self.zoom
+                      else self.ZOOM_IN_LERP)
+        t_center = min(1.0, self.CENTER_LERP * dt)
+        t_zoom = min(1.0, zoom_speed * dt)
+
+        self.cx += (mid_x - self.cx) * t_center
+        self.cy += (mid_y - self.cy) * t_center
+        self.zoom += (desired_zoom - self.zoom) * t_zoom
+
+        # Hard safety clamp: after smoothing, if either drone would
+        # still fall outside the safety box, snap zoom down and recentre
+        # so they are guaranteed on-screen this frame.
+        self._enforce_visibility(player, target)
+
+    def _enforce_visibility(self, player, target):
+        """Guarantee both drones are inside the viewport safety box."""
+        min_x = min(player[0], target[0])
+        max_x = max(player[0], target[0])
+        min_y = min(player[1], target[1])
+        max_y = max(player[1], target[1])
+
+        half_w_world = WIDTH / 2 - self.SAFETY_MARGIN
+        half_h_world = HEIGHT / 2 - self.SAFETY_MARGIN
+
+        # Max zoom such that both drones fit inside the safety box
+        need_zoom_x = half_w_world / max((max_x - min_x) / 2, 1.0)
+        need_zoom_y = half_h_world / max((max_y - min_y) / 2, 1.0)
+        max_safe_zoom = max(self.MIN_ZOOM, min(need_zoom_x, need_zoom_y))
+
+        if self.zoom > max_safe_zoom:
+            self.zoom = max_safe_zoom
+
+        # After zoom is settled, nudge centre so both drones are inside
+        # the safety box on screen.
+        for drone in (player, target):
+            sx, sy = self.world_to_screen(drone[0], drone[1])
+            if sx < self.SAFETY_MARGIN:
+                self.cx -= (self.SAFETY_MARGIN - sx) / self.zoom
+            elif sx > WIDTH - self.SAFETY_MARGIN:
+                self.cx += (sx - (WIDTH - self.SAFETY_MARGIN)) / self.zoom
+            if sy < self.SAFETY_MARGIN:
+                self.cy -= (self.SAFETY_MARGIN - sy) / self.zoom
+            elif sy > HEIGHT - self.SAFETY_MARGIN:
+                self.cy += (sy - (HEIGHT - self.SAFETY_MARGIN)) / self.zoom
 
     def world_to_screen(self, wx, wy):
         """Convert world coordinates to screen pixel coordinates."""
