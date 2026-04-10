@@ -30,6 +30,9 @@ SKY_TOP = (15, 10, 40)
 SKY_BOT = (60, 40, 90)
 GROUND = (30, 65, 30)
 GROUND_LINE = (50, 100, 50)
+TREE_FOLIAGE = (28, 75, 38)
+TREE_FOLIAGE_DARK = (16, 50, 22)
+TREE_TRUNK = (55, 35, 22)
 WHITE = (255, 255, 255)
 HUD_COL = (0, 255, 180)
 THRUST_COL = (255, 160, 40)
@@ -48,31 +51,36 @@ def make_state(x, y, radius):
 # ── Dynamic camera ───────────────────────────────────────────────────
 
 class Camera:
-    """Computes a view that keeps both drones on screen with smooth tracking."""
+    """Computes a view that keeps both drones AND the ground on screen."""
 
     PADDING = 150       # min pixels of padding around drones on screen
-    MIN_ZOOM = 0.15     # don't zoom out more than this
+    GROUND_MARGIN = 40  # screen-space margin kept below the ground line
+    MIN_ZOOM = 0.12     # don't zoom out more than this
     MAX_ZOOM = 1.0      # 1:1 is the closest
     LERP_SPEED = 3.0    # how fast camera tracks (per second)
 
     def __init__(self):
         # Camera centre in world coords and current zoom
         self.cx = WIDTH / 2
-        self.cy = GROUND_Y / 2
+        self.cy = GROUND_Y - 200
         self.zoom = 1.0
 
     def update(self, player, target, dt):
-        """Smoothly track so both drones are visible."""
-        # Desired centre: midpoint of the two drones
+        """Smoothly track so both drones and the ground stay visible."""
         mid_x = (player[0] + target[0]) / 2
-        mid_y = (player[1] + target[1]) / 2
 
-        # Required span to fit both drones
+        # Vertical framing: from the higher drone's top all the way down
+        # to the ground, with a small margin below so the ground line
+        # is never flush with the bottom of the screen.
+        top_y = min(player[1], target[1]) - self.PADDING
+        bot_y = GROUND_Y + self.GROUND_MARGIN
+        mid_y = (top_y + bot_y) / 2
+
         dx = abs(player[0] - target[0]) + self.PADDING * 2
-        dy = abs(player[1] - target[1]) + self.PADDING * 2
+        dy = bot_y - top_y
 
         zoom_x = WIDTH / max(dx, 1)
-        zoom_y = GROUND_Y / max(dy, 1)   # only use sky area for framing
+        zoom_y = HEIGHT / max(dy, 1)
         desired_zoom = min(zoom_x, zoom_y)
         desired_zoom = max(self.MIN_ZOOM, min(self.MAX_ZOOM, desired_zoom))
 
@@ -180,6 +188,80 @@ def draw_ground(surf, cam):
             sx1, _ = cam.world_to_screen(gwx, GROUND_Y)
             sx2, sy2 = cam.world_to_screen(gwx + 30, GROUND_Y + 40)
             pygame.draw.line(surf, GROUND_LINE, (int(sx1), ground_sy), (int(sx2), int(sy2)), 1)
+
+
+# ── Trees (infinite deterministic forest) ────────────────────────────
+TREE_CELL_WIDTH = 42   # world px per potential tree slot
+TREE_DENSITY = 0.55    # fraction of cells that contain a tree
+_tree_cache = {}
+
+
+def _tree_at(cell):
+    """Return (offset_x, height, base_width) for a tree in `cell`, or None."""
+    cached = _tree_cache.get(cell)
+    if cached is not None:
+        return cached if cached is not False else None
+    rng = random.Random(cell * 2654435761 + 0xA5A5)
+    if rng.random() < TREE_DENSITY:
+        result = (
+            rng.uniform(-TREE_CELL_WIDTH * 0.4, TREE_CELL_WIDTH * 0.4),
+            rng.uniform(35, 75),   # height in world px
+            rng.uniform(18, 32),   # base width in world px
+        )
+        _tree_cache[cell] = result
+        return result
+    _tree_cache[cell] = False
+    return None
+
+
+def draw_trees(surf, cam):
+    """Draw trees across the visible ground span as parallax reference."""
+    # World-space horizontal extent currently on screen, plus a little slack
+    left_wx = cam.cx - (WIDTH / 2) / cam.zoom - TREE_CELL_WIDTH
+    right_wx = cam.cx + (WIDTH / 2) / cam.zoom + TREE_CELL_WIDTH
+    start_cell = int(left_wx // TREE_CELL_WIDTH)
+    end_cell = int(right_wx // TREE_CELL_WIDTH) + 1
+
+    trunk_col = TREE_TRUNK
+    foliage_col = TREE_FOLIAGE
+    outline_col = TREE_FOLIAGE_DARK
+
+    for cell in range(start_cell, end_cell):
+        tree = _tree_at(cell)
+        if tree is None:
+            continue
+        offset, h, w = tree
+        world_x = cell * TREE_CELL_WIDTH + offset
+
+        base_sx, base_sy = cam.world_to_screen(world_x, GROUND_Y)
+        _, top_sy = cam.world_to_screen(world_x, GROUND_Y - h)
+
+        # Cull if entirely off-screen vertically
+        if top_sy > HEIGHT or base_sy < 0:
+            continue
+
+        half_w = max(1.0, (w * 0.5) * cam.zoom)
+        trunk_h = max(1, int(6 * cam.zoom))
+        trunk_w = max(1, int(3 * cam.zoom))
+
+        # Trunk (small rect just under the ground line)
+        trunk_rect = pygame.Rect(
+            int(base_sx - trunk_w / 2),
+            int(base_sy - trunk_h),
+            trunk_w,
+            trunk_h,
+        )
+        pygame.draw.rect(surf, trunk_col, trunk_rect)
+
+        # Pine-style triangular foliage
+        tri = [
+            (int(base_sx - half_w), int(base_sy - trunk_h)),
+            (int(base_sx + half_w), int(base_sy - trunk_h)),
+            (int(base_sx), int(top_sy)),
+        ]
+        pygame.draw.polygon(surf, foliage_col, tri)
+        if cam.zoom > 0.35:
+            pygame.draw.polygon(surf, outline_col, tri, 1)
 
 
 def draw_altimeter(surf, font, player_y):
@@ -758,6 +840,7 @@ def run():
         screen.blit(sky_surf, (0, 0))
         draw_stars(screen, stars)
         draw_ground(screen, cam)
+        draw_trees(screen, cam)
 
         if game_state == STATE_TITLE:
             title = big_font.render("DRONE INTERCEPT", True, WHITE)
