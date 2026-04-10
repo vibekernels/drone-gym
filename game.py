@@ -293,6 +293,148 @@ def draw_camera_view(surf, font, player, target):
     surf.blit(btxt, (cam_x + CAM_WIDTH + 8, cam_y + 10))
 
 
+# ── Model I/O panel ──────────────────────────────────────────────────
+PANEL_W = 230
+PANEL_H = 360
+PANEL_BG = (5, 5, 20, 210)
+PANEL_LABEL = (150, 200, 200)
+TURN_COL = (255, 200, 120)
+TURN_DIM = (130, 100, 50)
+THRUST_COL_BRIGHT = (255, 160, 40)
+THRUST_DIM = (130, 80, 20)
+VALUE_COL = (150, 255, 150)
+
+
+def _draw_bipolar_bar(surf, x, y, w, h, value):
+    """Draw a centered bar that extends left or right from the midpoint."""
+    bg = pygame.Rect(x, y, w, h)
+    pygame.draw.rect(surf, (30, 30, 40), bg)
+    cx = x + w // 2
+    pygame.draw.line(surf, (90, 90, 110), (cx, y - 1), (cx, y + h + 1), 1)
+    v = max(-1.0, min(1.0, value))
+    bar_len = int(abs(v) * w / 2)
+    if v >= 0:
+        pygame.draw.rect(surf, HUD_COL, (cx, y, bar_len, h))
+    else:
+        pygame.draw.rect(surf, HUD_COL, (cx - bar_len, y, bar_len, h))
+
+
+def draw_model_panel(surf, font, small_font, autopilot):
+    """Live visualization of the policy's inputs and outputs."""
+    panel_x = WIDTH - PANEL_W - 10
+    panel_y = 100
+
+    bg = pygame.Surface((PANEL_W, PANEL_H), pygame.SRCALPHA)
+    bg.fill(PANEL_BG)
+    surf.blit(bg, (panel_x, panel_y))
+    pygame.draw.rect(surf, HUD_COL, (panel_x, panel_y, PANEL_W, PANEL_H), 1)
+
+    title = font.render("MODEL I/O", True, HUD_COL)
+    surf.blit(title, (panel_x + 10, panel_y + 6))
+
+    y = panel_y + 30
+
+    # ── Camera frame stack ───────────────────────────────────────────
+    label = small_font.render("CAMERA  (4 frames x 64 px)", True, PANEL_LABEL)
+    surf.blit(label, (panel_x + 10, y))
+    y += 14
+
+    frames = autopilot.frames  # (4, 64)
+    cell_w = 3
+    cell_h = 9
+    frame_gap = 2
+    origin_x = panel_x + 10
+    bg_rect = pygame.Rect(origin_x - 1, y - 1,
+                          cell_w * 64 + 2, 4 * cell_h + 3 * frame_gap + 2)
+    pygame.draw.rect(surf, (12, 12, 22), bg_rect)
+    # Row 0 is oldest, row 3 is newest
+    for i in range(4):
+        row_y = y + i * (cell_h + frame_gap)
+        for j in range(64):
+            v = float(frames[i, j])
+            if v > 0.02:
+                ic = max(40, min(255, int(v * 255)))
+                col = (ic, int(ic * 0.35), int(ic * 0.35))
+            else:
+                col = (22, 22, 32)
+            pygame.draw.rect(surf, col, (origin_x + j * cell_w, row_y, cell_w, cell_h))
+    # "newest" tick
+    tick_y = y + 3 * (cell_h + frame_gap) + cell_h + 1
+    pygame.draw.polygon(surf, HUD_COL,
+                        [(origin_x - 4, tick_y - 3), (origin_x - 4, tick_y + 3),
+                         (origin_x - 1, tick_y)])
+    y += 4 * cell_h + 3 * frame_gap + 8
+
+    # ── IMU ──────────────────────────────────────────────────────────
+    label = small_font.render("IMU  (gyro / accel_fwd / accel_lat)", True, PANEL_LABEL)
+    surf.blit(label, (panel_x + 10, y))
+    y += 14
+
+    aux = autopilot.last_aux_vec
+    imu_labels = ("gyro", "a_fwd", "a_lat")
+    bar_w = 130
+    bar_h = 7
+    for lbl, val in zip(imu_labels, aux):
+        lt = small_font.render(lbl, True, (180, 180, 180))
+        surf.blit(lt, (panel_x + 10, y - 1))
+        _draw_bipolar_bar(surf, panel_x + 55, y + 2, bar_w, bar_h, float(val))
+        vt = small_font.render(f"{float(val):+.2f}", True, (200, 200, 200))
+        surf.blit(vt, (panel_x + 55 + bar_w + 6, y - 1))
+        y += 14
+
+    y += 4
+    pygame.draw.line(surf, (50, 80, 80),
+                     (panel_x + 10, y), (panel_x + PANEL_W - 10, y), 1)
+    y += 6
+
+    # ── TURN probabilities ───────────────────────────────────────────
+    label = small_font.render("TURN  (left / none / right)", True, TURN_COL)
+    surf.blit(label, (panel_x + 10, y))
+    y += 14
+
+    turn_probs = autopilot.last_turn_probs
+    turn_labels = ("L", "N", "R")
+    max_bar = 150
+    for i, (tl, p) in enumerate(zip(turn_labels, turn_probs)):
+        lt = small_font.render(tl, True, (200, 200, 200))
+        surf.blit(lt, (panel_x + 12, y - 1))
+        bx = panel_x + 30
+        pygame.draw.rect(surf, (30, 30, 40), (bx, y + 2, max_bar, bar_h))
+        col = TURN_COL if i == autopilot.last_turn else TURN_DIM
+        pygame.draw.rect(surf, col, (bx, y + 2, int(float(p) * max_bar), bar_h))
+        pt = small_font.render(f"{int(float(p) * 100):3d}%", True, (200, 200, 200))
+        surf.blit(pt, (bx + max_bar + 6, y - 1))
+        y += 13
+
+    y += 4
+
+    # ── THRUST probabilities ─────────────────────────────────────────
+    label = small_font.render("THRUST  (off / on)", True, THRUST_COL_BRIGHT)
+    surf.blit(label, (panel_x + 10, y))
+    y += 14
+
+    thrust_probs = autopilot.last_thrust_probs
+    thrust_labels = ("OFF", "ON")
+    for i, (tl, p) in enumerate(zip(thrust_labels, thrust_probs)):
+        lt = small_font.render(tl, True, (200, 200, 200))
+        surf.blit(lt, (panel_x + 12, y - 1))
+        bx = panel_x + 42
+        pygame.draw.rect(surf, (30, 30, 40), (bx, y + 2, max_bar - 12, bar_h))
+        col = THRUST_COL_BRIGHT if i == autopilot.last_thrust else THRUST_DIM
+        pygame.draw.rect(surf, col, (bx, y + 2, int(float(p) * (max_bar - 12)), bar_h))
+        pt = small_font.render(f"{int(float(p) * 100):3d}%", True, (200, 200, 200))
+        surf.blit(pt, (bx + (max_bar - 12) + 6, y - 1))
+        y += 13
+
+    y += 4
+
+    # ── Value estimate ───────────────────────────────────────────────
+    v_label = small_font.render("VALUE", True, VALUE_COL)
+    surf.blit(v_label, (panel_x + 10, y))
+    v_txt = font.render(f"{autopilot.last_value:+.2f}", True, VALUE_COL)
+    surf.blit(v_txt, (panel_x + 60, y - 3))
+
+
 # ── Particle explosion ──────────────────────────────────────────────
 
 class Particle:
@@ -345,6 +487,11 @@ class Autopilot:
         self.prev_vx = 0.0
         self.prev_vy = 0.0
         self.prev_angle = 0.0
+        # Model I/O snapshots for visualization
+        self.last_aux_vec = np.zeros(3, dtype=np.float32)
+        self.last_turn_probs = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        self.last_thrust_probs = np.array([1.0, 0.0], dtype=np.float32)
+        self.last_value = 0.0
 
     def load(self):
         if self.policy is not None:
@@ -364,6 +511,10 @@ class Autopilot:
         self.prev_vx = 0.0
         self.prev_vy = 0.0
         self.prev_angle = 0.0
+        self.last_aux_vec[:] = 0.0
+        self.last_turn_probs[:] = [0.0, 1.0, 0.0]
+        self.last_thrust_probs[:] = [1.0, 0.0]
+        self.last_value = 0.0
 
     def _render_camera_line(self, player, target):
         line = np.zeros(AI_CAM_WIDTH, dtype=np.float32)
@@ -411,9 +562,21 @@ class Autopilot:
         self.frames[:-1] = self.frames[1:]
         self.frames[-1] = new_line
 
+        aux = self._get_aux(player)
+        self.last_aux_vec = aux.copy()
+
         cam_t = torch.from_numpy(self.frames).unsqueeze(0)
-        aux_t = torch.from_numpy(self._get_aux(player)).unsqueeze(0)
-        a_turn, a_thrust, _, _, _ = self.policy.get_action_and_value(cam_t, aux_t)
+        aux_t = torch.from_numpy(aux).unsqueeze(0)
+
+        # Forward pass directly so we can extract logits + value for the HUD
+        turn_logits, thrust_logits, value = self.policy(cam_t, aux_t)
+        self.last_turn_probs = torch.softmax(turn_logits, dim=-1).squeeze(0).numpy()
+        self.last_thrust_probs = torch.softmax(thrust_logits, dim=-1).squeeze(0).numpy()
+        self.last_value = float(value.item())
+
+        # Sample actions (matches training-time behavior)
+        a_turn = torch.distributions.Categorical(logits=turn_logits).sample()
+        a_thrust = torch.distributions.Categorical(logits=thrust_logits).sample()
 
         self.last_turn = a_turn.item()
         self.last_thrust = a_thrust.item()
@@ -434,6 +597,7 @@ def run():
     pygame.display.set_caption("Drone Intercept 2D")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("menlo", 18)
+    small_font = pygame.font.SysFont("menlo", 12)
     big_font = pygame.font.SysFont("menlo", 36, bold=True)
 
     # Pre-render sky
@@ -610,6 +774,7 @@ def run():
                 act_str = " + ".join(actions) if actions else "COAST"
                 act_txt = font.render(act_str, True, WHITE)
                 screen.blit(act_txt, (WIDTH // 2 - act_txt.get_width() // 2, 38))
+                draw_model_panel(screen, font, small_font, autopilot)
             else:
                 mode_txt = font.render("[C] auto pilot", True, (100, 100, 100))
                 screen.blit(mode_txt, (WIDTH // 2 - mode_txt.get_width() // 2, 15))
