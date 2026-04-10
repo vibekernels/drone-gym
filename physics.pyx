@@ -46,16 +46,38 @@ cpdef void player_update(double[:] s, double dt, int turn, int thrust) noexcept:
 
 
 cpdef void target_update(double[:] s, double dt,
-                         double cx, double cy,
-                         double orbit_radius, double orbit_speed,
+                         double base_alt, double base_speed,
+                         double left_bound, double right_bound,
                          double phase) noexcept:
-    """Update target drone – flies a smooth figure-8-ish patrol."""
-    phase_val = phase  # caller tracks phase
-    s[0] = cx + orbit_radius * sin(phase_val)
-    s[1] = cy + orbit_radius * 0.4 * sin(phase_val * 2.0)
-    # Derive velocity for visual tilt
-    s[2] = orbit_radius * cos(phase_val) * orbit_speed
-    s[3] = orbit_radius * 0.8 * cos(phase_val * 2.0) * orbit_speed
+    """Update target drone – surveillance patrol, cruising left/right.
+
+    s[2] (vx) carries the current horizontal direction/speed.
+    phase is used for gentle vertical bobbing and speed variation.
+    Reverses direction when hitting left_bound / right_bound.
+    """
+    # Speed varies gently: base_speed +/- 20%
+    cdef double speed = base_speed * (1.0 + 0.2 * sin(phase * 0.7))
+
+    # Reverse at boundaries
+    if s[0] <= left_bound and s[2] < 0:
+        s[2] = speed
+    elif s[0] >= right_bound and s[2] > 0:
+        s[2] = -speed
+    else:
+        # Maintain direction, adjust magnitude
+        if s[2] >= 0:
+            s[2] = speed
+        else:
+            s[2] = -speed
+
+    # Gentle vertical bobbing around base altitude
+    cdef double target_y = base_alt + 30.0 * sin(phase * 0.5)
+    s[3] = (target_y - s[1]) * 2.0  # soft spring toward target altitude
+
+    # Integrate position
+    s[0] += s[2] * dt
+    s[1] += s[3] * dt
+
     # Face direction of travel
     s[4] = atan2(s[2], -s[3])
 

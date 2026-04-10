@@ -1,8 +1,8 @@
 """CNN policy for the drone intercept game.
 
 Observation is (NUM_FRAMES, CAM_WIDTH) = (4, 64) treated as a 2D image
-with 1 channel for Conv2d.  Auxiliary vector is concatenated after the
-conv encoder.
+with 1 channel for Conv2d.  IMU auxiliary vector (gyro_z, accel_fwd,
+accel_lat) is concatenated after the conv encoder.
 
 Outputs:
   - turn_logits (3): left / none / right
@@ -17,7 +17,7 @@ from torch.distributions import Categorical
 
 NUM_FRAMES = 4
 CAM_WIDTH = 64
-AUX_SIZE = 4
+AUX_SIZE = 3
 
 
 class DronePolicy(nn.Module):

@@ -1,7 +1,7 @@
 """Headless drone-intercept environment with vectorized batch support.
 
-Observation: stacked 1D camera frames → (num_frames, cam_width) uint8 image
-             + small aux vector (angular_vel, altitude, vert_speed, distance)
+Observation: stacked 1D camera frames → (num_frames, cam_width) float32 image
+             + IMU aux vector (gyro_z, accel_forward, accel_lateral)
 Action:      MultiDiscrete([3, 2]) → (turn: left/none/right, thrust: off/on)
 """
 
@@ -24,10 +24,10 @@ PLAYER_RADIUS = 14.0
 TARGET_RADIUS = 18.0
 
 # Reward shaping
-REWARD_HIT = 10.0
-REWARD_STEP = -0.005         # small time penalty
-REWARD_BEARING = 0.02        # per-step bonus for pointing at target
-REWARD_CLOSING = 0.01        # per-step bonus for closing distance
+REWARD_HIT = 50.0
+REWARD_STEP = -0.01          # time penalty (stronger urgency)
+REWARD_BEARING = 0.005       # per-step bonus for pointing at target (reduced)
+REWARD_CLOSING = 0.005       # per-step bonus for closing distance (reduced)
 
 
 class DroneInterceptEnv:
@@ -43,11 +43,16 @@ class DroneInterceptEnv:
         self.frames = np.zeros((NUM_FRAMES, CAM_WIDTH), dtype=np.float32)
         self.step_count = 0
         self.prev_dist = 0.0
+        # IMU state tracking
+        self.prev_vx = 0.0
+        self.prev_vy = 0.0
+        self.prev_angle = 0.0
+        # Target patrol parameters
         self.target_phase = 0.0
-        self.orbit_cx = 0.0
-        self.orbit_cy = 0.0
-        self.orbit_radius = 0.0
-        self.orbit_speed = 0.0
+        self.target_alt = 0.0
+        self.target_speed = 0.0
+        self.patrol_left = 0.0
+        self.patrol_right = 0.0
 
     def reset(self):
         # Player starts on the ground, facing up
@@ -58,19 +63,29 @@ class DroneInterceptEnv:
         self.player[4] = 0.0
         self.player[5] = PLAYER_RADIUS
 
-        # Randomize target orbit
+        # Randomize target patrol
         self.target_phase = self.rng.uniform(0, 2 * math.pi)
-        self.orbit_cx = self.rng.uniform(200, WORLD_W - 200)
-        self.orbit_cy = self.rng.uniform(80, 250)
-        self.orbit_radius = 320.0
-        self.orbit_speed = self.rng.uniform(0.5, 1.1)
+        self.target_alt = self.rng.uniform(80, 250)
+        self.target_speed = self.rng.uniform(60, 150)
+        # Patrol bounds: a wide horizontal range
+        centre_x = self.rng.uniform(300, WORLD_W - 300)
+        patrol_half = self.rng.uniform(200, 400)
+        self.patrol_left = centre_x - patrol_half
+        self.patrol_right = centre_x + patrol_half
 
         self.target[5] = TARGET_RADIUS
-        physics.target_update(self.target, 0.0, self.orbit_cx, self.orbit_cy,
-                              self.orbit_radius, self.orbit_speed, self.target_phase)
+        # Start somewhere along the patrol route, moving left or right
+        self.target[0] = self.rng.uniform(self.patrol_left, self.patrol_right)
+        self.target[1] = self.target_alt
+        self.target[2] = self.target_speed * self.rng.choice([-1, 1])
+        self.target[3] = 0.0
+        self.target[4] = 0.0
 
         self.prev_dist = physics.distance(self.player, self.target)
         self.step_count = 0
+        self.prev_vx = 0.0
+        self.prev_vy = 0.0
+        self.prev_angle = 0.0
         self.frames[:] = 0
 
         obs = self._get_obs()
@@ -85,9 +100,9 @@ class DroneInterceptEnv:
         physics.player_update(self.player, dt, turn, thrust)
         physics.clamp_world(self.player, WORLD_H)
 
-        self.target_phase += self.orbit_speed * dt
-        physics.target_update(self.target, dt, self.orbit_cx, self.orbit_cy,
-                              self.orbit_radius, self.orbit_speed, self.target_phase)
+        self.target_phase += dt
+        physics.target_update(self.target, dt, self.target_alt, self.target_speed,
+                              self.patrol_left, self.patrol_right, self.target_phase)
 
         self.step_count += 1
 
@@ -150,12 +165,50 @@ class DroneInterceptEnv:
         return self.frames.copy()
 
     def get_aux(self):
-        """Auxiliary observations: (angular_vel_norm, altitude_norm, vspeed_norm, dist_norm)."""
-        ang_vel = self.player[4] / math.pi      # roughly [-1, 1]
-        alt = 1.0 - self.player[1] / WORLD_H    # 0=ground, 1=top
-        vspeed = -self.player[3] / 400.0         # positive=climbing
-        dist = physics.distance(self.player, self.target) / 800.0
-        return np.array([ang_vel, alt, vspeed, dist], dtype=np.float32)
+        """IMU sensor: (gyro_z, accel_forward, accel_lateral).
+
+        gyro_z:        angular velocity (rad/s), normalized
+        accel_forward: proper acceleration along drone's forward axis (body frame)
+        accel_lateral: proper acceleration along drone's lateral axis (body frame)
+
+        The accelerometer measures all forces except gravity, in the body frame.
+        At rest on ground it reads +g upward; in freefall it reads 0.
+        """
+        dt = 1.0 / 60.0
+        vx, vy = self.player[2], self.player[3]
+        angle = self.player[4]
+
+        # Gyroscope: angular rate
+        gyro_z = (angle - self.prev_angle) / dt
+
+        # World-frame acceleration (finite difference)
+        ax_world = (vx - self.prev_vx) / dt
+        ay_world = (vy - self.prev_vy) / dt
+
+        # Proper acceleration = total - gravity (what an accelerometer reads)
+        # Gravity is (0, +GRAVITY) in world frame (GRAVITY=300, downward=+Y)
+        ax_proper = ax_world
+        ay_proper = ay_world - 300.0
+
+        # Rotate into body frame
+        # Forward direction in world: (sin(angle), -cos(angle))
+        # Lateral (right) direction:  (cos(angle),  sin(angle))
+        sa = math.sin(angle)
+        ca = math.cos(angle)
+        accel_fwd = ax_proper * sa - ay_proper * ca
+        accel_lat = ax_proper * ca + ay_proper * sa
+
+        # Save for next frame
+        self.prev_vx = vx
+        self.prev_vy = vy
+        self.prev_angle = angle
+
+        # Normalize to roughly [-1, 1] range
+        gyro_z_n = gyro_z / 10.0          # turn rate ~4 rad/s max
+        accel_fwd_n = accel_fwd / 600.0    # thrust is 600 px/s²
+        accel_lat_n = accel_lat / 600.0
+
+        return np.array([gyro_z_n, accel_fwd_n, accel_lat_n], dtype=np.float32)
 
 
 # ── Vectorized batch environment ─────────────────────────────────────
@@ -173,7 +226,7 @@ class VecEnv:
 
         # Pre-allocated output buffers
         self.obs_buf = np.zeros((num_envs, NUM_FRAMES, CAM_WIDTH), dtype=np.float32)
-        self.aux_buf = np.zeros((num_envs, 4), dtype=np.float32)
+        self.aux_buf = np.zeros((num_envs, 3), dtype=np.float32)
         self.reward_buf = np.zeros(num_envs, dtype=np.float32)
         self.done_buf = np.zeros(num_envs, dtype=bool)
         self.trunc_buf = np.zeros(num_envs, dtype=bool)

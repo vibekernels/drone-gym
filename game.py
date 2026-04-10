@@ -333,12 +333,18 @@ CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 class Autopilot:
     """Wraps the trained policy for use inside the game loop."""
 
+    GRAVITY = 300.0  # must match physics.pyx
+
     def __init__(self):
         self.policy = None
         self.frames = np.zeros((NUM_FRAMES, AI_CAM_WIDTH), dtype=np.float32)
         self.cam_out = array.array("d", [0.0, 0.0, 0.0])
         self.last_turn = 1   # 0=left 1=none 2=right
         self.last_thrust = 0
+        # IMU state tracking
+        self.prev_vx = 0.0
+        self.prev_vy = 0.0
+        self.prev_angle = 0.0
 
     def load(self):
         if self.policy is not None:
@@ -355,6 +361,9 @@ class Autopilot:
         self.frames[:] = 0
         self.last_turn = 1
         self.last_thrust = 0
+        self.prev_vx = 0.0
+        self.prev_vy = 0.0
+        self.prev_angle = 0.0
 
     def _render_camera_line(self, player, target):
         line = np.zeros(AI_CAM_WIDTH, dtype=np.float32)
@@ -370,12 +379,30 @@ class Autopilot:
             line[left:right] = intensity
         return line
 
-    def _get_aux(self, player, target):
-        ang_vel = player[4] / math.pi
-        alt = 1.0 - player[1] / WORLD_H
-        vspeed = -player[3] / 400.0
-        dist = physics.distance(player, target) / 800.0
-        return np.array([ang_vel, alt, vspeed, dist], dtype=np.float32)
+    def _get_aux(self, player):
+        """IMU sensor: gyro_z, accel_forward, accel_lateral in body frame."""
+        dt = 1.0 / 60.0
+        vx, vy = player[2], player[3]
+        angle = player[4]
+
+        gyro_z = (angle - self.prev_angle) / dt
+
+        ax_world = (vx - self.prev_vx) / dt
+        ay_world = (vy - self.prev_vy) / dt
+        ax_proper = ax_world
+        ay_proper = ay_world - self.GRAVITY
+
+        sa = math.sin(angle)
+        ca = math.cos(angle)
+        accel_fwd = ax_proper * sa - ay_proper * ca
+        accel_lat = ax_proper * ca + ay_proper * sa
+
+        self.prev_vx = vx
+        self.prev_vy = vy
+        self.prev_angle = angle
+
+        return np.array([gyro_z / 10.0, accel_fwd / 600.0, accel_lat / 600.0],
+                        dtype=np.float32)
 
     @torch.no_grad()
     def act(self, player, target):
@@ -385,7 +412,7 @@ class Autopilot:
         self.frames[-1] = new_line
 
         cam_t = torch.from_numpy(self.frames).unsqueeze(0)
-        aux_t = torch.from_numpy(self._get_aux(player, target)).unsqueeze(0)
+        aux_t = torch.from_numpy(self._get_aux(player)).unsqueeze(0)
         a_turn, a_thrust, _, _, _ = self.policy.get_action_and_value(cam_t, aux_t)
 
         self.last_turn = a_turn.item()
@@ -429,23 +456,33 @@ def run():
     player = make_state(WIDTH / 2, GROUND_Y - 30, PLAYER_RADIUS)
     target = make_state(WIDTH / 2, 150, TARGET_RADIUS)
     target_phase = 0.0
-    orbit_cx, orbit_cy = WIDTH / 2, 160.0
-    orbit_radius = 320.0
-    orbit_speed = 0.7
+    target_alt = 160.0
+    target_speed = 100.0
+    patrol_left = 100.0
+    patrol_right = WIDTH - 100.0
     particles = []
     score = 0
     attempts = 0
     hit_timer = 0.0
 
     def reset_round():
-        nonlocal target_phase, orbit_cx, orbit_cy, orbit_speed
+        nonlocal target_phase, target_alt, target_speed, patrol_left, patrol_right
         player[0] = WIDTH / 2
         player[1] = GROUND_Y - 30
         player[2] = player[3] = player[4] = 0.0
         target_phase = random.uniform(0, 2 * math.pi)
-        orbit_cx = random.uniform(200, WIDTH - 200)
-        orbit_cy = random.uniform(80, 250)
-        orbit_speed = random.uniform(0.5, 1.1)
+        target_alt = random.uniform(80, 250)
+        target_speed = random.uniform(60, 150)
+        centre_x = random.uniform(300, WIDTH - 300)
+        patrol_half = random.uniform(200, 400)
+        patrol_left = centre_x - patrol_half
+        patrol_right = centre_x + patrol_half
+        # Start target along the patrol route
+        target[0] = random.uniform(patrol_left, patrol_right)
+        target[1] = target_alt
+        target[2] = target_speed * random.choice([-1, 1])
+        target[3] = 0.0
+        target[4] = 0.0
 
     running = True
     while running:
@@ -495,9 +532,9 @@ def run():
             physics.player_update(player, dt, turn, thrust)
             physics.clamp_world(player, float(GROUND_Y))
 
-            target_phase += orbit_speed * dt
-            physics.target_update(target, dt, orbit_cx, orbit_cy,
-                                  orbit_radius, orbit_speed, target_phase)
+            target_phase += dt
+            physics.target_update(target, dt, target_alt, target_speed,
+                                  patrol_left, patrol_right, target_phase)
 
             if physics.check_collision(player, target):
                 rel_spd = physics.relative_speed(player, target)
