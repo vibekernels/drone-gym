@@ -460,10 +460,9 @@ PANEL_W = 230
 PANEL_H = 360
 PANEL_BG = (5, 5, 20, 210)
 PANEL_LABEL = (150, 200, 200)
-TURN_COL = (255, 200, 120)
-TURN_DIM = (130, 100, 50)
-THRUST_COL_BRIGHT = (255, 160, 40)
-THRUST_DIM = (130, 80, 20)
+ROTOR_COL = (255, 160, 40)
+ROTOR_DIM = (90, 55, 15)
+ROTOR_DIST = (180, 110, 30)
 VALUE_COL = (150, 255, 150)
 
 
@@ -549,44 +548,43 @@ def draw_model_panel(surf, font, small_font, autopilot):
                      (panel_x + 10, y), (panel_x + PANEL_W - 10, y), 1)
     y += 6
 
-    # ── TURN probabilities ───────────────────────────────────────────
-    label = small_font.render("TURN  (left / none / right)", True, TURN_COL)
+    # ── ROTOR throttles (continuous Beta outputs) ────────────────────
+    label = small_font.render("ROTORS  (Beta α/β → throttle)", True, ROTOR_COL)
     surf.blit(label, (panel_x + 10, y))
     y += 14
 
-    turn_probs = autopilot.last_turn_probs
-    turn_labels = ("L", "N", "R")
     max_bar = 150
-    for i, (tl, p) in enumerate(zip(turn_labels, turn_probs)):
-        lt = small_font.render(tl, True, (200, 200, 200))
+    rotor_data = (
+        ("L", autopilot.last_left_alpha, autopilot.last_left_beta,
+         autopilot.last_left_action),
+        ("R", autopilot.last_right_alpha, autopilot.last_right_beta,
+         autopilot.last_right_action),
+    )
+    for lbl, alpha, beta, sample in rotor_data:
+        lt = small_font.render(lbl, True, (200, 200, 200))
         surf.blit(lt, (panel_x + 12, y - 1))
         bx = panel_x + 30
+        # Background track
         pygame.draw.rect(surf, (30, 30, 40), (bx, y + 2, max_bar, bar_h))
-        col = TURN_COL if i == autopilot.last_turn else TURN_DIM
-        pygame.draw.rect(surf, col, (bx, y + 2, int(float(p) * max_bar), bar_h))
-        pt = small_font.render(f"{int(float(p) * 100):3d}%", True, (200, 200, 200))
+        # Distribution mean and std
+        ab_sum = max(1e-6, alpha + beta)
+        mean = alpha / ab_sum
+        var = (alpha * beta) / (ab_sum * ab_sum * (ab_sum + 1.0))
+        std = math.sqrt(max(0.0, var))
+        # Faint band: mean ± std (1-σ uncertainty)
+        lo = max(0.0, mean - std)
+        hi = min(1.0, mean + std)
+        band_x = bx + int(lo * max_bar)
+        band_w = max(1, int((hi - lo) * max_bar))
+        pygame.draw.rect(surf, ROTOR_DIM, (band_x, y + 2, band_w, bar_h))
+        # Solid bar up to the mean
+        pygame.draw.rect(surf, ROTOR_DIST, (bx, y + 2, int(mean * max_bar), bar_h))
+        # Sampled action: bright tick mark
+        sx = bx + int(max(0.0, min(1.0, sample)) * max_bar)
+        pygame.draw.line(surf, ROTOR_COL, (sx, y), (sx, y + bar_h + 4), 2)
+        pt = small_font.render(f"{int(sample * 100):3d}%", True, (220, 220, 220))
         surf.blit(pt, (bx + max_bar + 6, y - 1))
-        y += 13
-
-    y += 4
-
-    # ── THRUST probabilities ─────────────────────────────────────────
-    label = small_font.render("THRUST  (off / on)", True, THRUST_COL_BRIGHT)
-    surf.blit(label, (panel_x + 10, y))
-    y += 14
-
-    thrust_probs = autopilot.last_thrust_probs
-    thrust_labels = ("OFF", "ON")
-    for i, (tl, p) in enumerate(zip(thrust_labels, thrust_probs)):
-        lt = small_font.render(tl, True, (200, 200, 200))
-        surf.blit(lt, (panel_x + 12, y - 1))
-        bx = panel_x + 42
-        pygame.draw.rect(surf, (30, 30, 40), (bx, y + 2, max_bar - 12, bar_h))
-        col = THRUST_COL_BRIGHT if i == autopilot.last_thrust else THRUST_DIM
-        pygame.draw.rect(surf, col, (bx, y + 2, int(float(p) * (max_bar - 12)), bar_h))
-        pt = small_font.render(f"{int(float(p) * 100):3d}%", True, (200, 200, 200))
-        surf.blit(pt, (bx + (max_bar - 12) + 6, y - 1))
-        y += 13
+        y += 14
 
     y += 4
 
@@ -643,16 +641,19 @@ class Autopilot:
         self.policy = None
         self.frames = np.zeros((NUM_FRAMES, AI_CAM_WIDTH), dtype=np.float32)
         self.cam_out = array.array("d", [0.0, 0.0, 0.0])
-        self.last_turn = 1   # 0=left 1=none 2=right
-        self.last_thrust = 0
         # IMU state tracking
         self.prev_vx = 0.0
         self.prev_vy = 0.0
         self.prev_angle = 0.0
         # Model I/O snapshots for visualization
         self.last_aux_vec = np.zeros(3, dtype=np.float32)
-        self.last_turn_probs = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-        self.last_thrust_probs = np.array([1.0, 0.0], dtype=np.float32)
+        # Continuous rotor outputs: Beta(α, β) per rotor + sampled action
+        self.last_left_alpha = 1.0
+        self.last_left_beta = 1.0
+        self.last_right_alpha = 1.0
+        self.last_right_beta = 1.0
+        self.last_left_action = 0.0
+        self.last_right_action = 0.0
         self.last_value = 0.0
 
     def load(self):
@@ -668,14 +669,16 @@ class Autopilot:
 
     def reset(self):
         self.frames[:] = 0
-        self.last_turn = 1
-        self.last_thrust = 0
         self.prev_vx = 0.0
         self.prev_vy = 0.0
         self.prev_angle = 0.0
         self.last_aux_vec[:] = 0.0
-        self.last_turn_probs[:] = [0.0, 1.0, 0.0]
-        self.last_thrust_probs[:] = [1.0, 0.0]
+        self.last_left_alpha = 1.0
+        self.last_left_beta = 1.0
+        self.last_right_alpha = 1.0
+        self.last_right_beta = 1.0
+        self.last_left_action = 0.0
+        self.last_right_action = 0.0
         self.last_value = 0.0
 
     def _render_camera_line(self, player, target):
@@ -719,7 +722,7 @@ class Autopilot:
 
     @torch.no_grad()
     def act(self, player, target):
-        """Return (turn, thrust) where turn is -1/0/+1 and thrust is 0/1."""
+        """Return (left_power, right_power) — floats in [0, 1]."""
         new_line = self._render_camera_line(player, target)
         self.frames[:-1] = self.frames[1:]
         self.frames[-1] = new_line
@@ -730,21 +733,23 @@ class Autopilot:
         cam_t = torch.from_numpy(self.frames).unsqueeze(0)
         aux_t = torch.from_numpy(aux).unsqueeze(0)
 
-        # Forward pass directly so we can extract logits + value for the HUD
-        turn_logits, thrust_logits, value = self.policy(cam_t, aux_t)
-        self.last_turn_probs = torch.softmax(turn_logits, dim=-1).squeeze(0).numpy()
-        self.last_thrust_probs = torch.softmax(thrust_logits, dim=-1).squeeze(0).numpy()
+        # Forward pass: extract Beta(α, β) per rotor + value for the HUD.
+        (alpha_l, beta_l), (alpha_r, beta_r), value = self.policy(cam_t, aux_t)
+        self.last_left_alpha = float(alpha_l.item())
+        self.last_left_beta = float(beta_l.item())
+        self.last_right_alpha = float(alpha_r.item())
+        self.last_right_beta = float(beta_r.item())
         self.last_value = float(value.item())
 
-        # Sample actions (matches training-time behavior)
-        a_turn = torch.distributions.Categorical(logits=turn_logits).sample()
-        a_thrust = torch.distributions.Categorical(logits=thrust_logits).sample()
+        # Sample (matches training-time behaviour).
+        left_dist = torch.distributions.Beta(alpha_l, beta_l)
+        right_dist = torch.distributions.Beta(alpha_r, beta_r)
+        a_left = float(left_dist.sample().item())
+        a_right = float(right_dist.sample().item())
 
-        self.last_turn = a_turn.item()
-        self.last_thrust = a_thrust.item()
-        turn = self.last_turn - 1   # 0,1,2 → -1,0,+1
-        thrust = self.last_thrust
-        return turn, thrust
+        self.last_left_action = a_left
+        self.last_right_action = a_right
+        return a_left, a_right
 
 
 # ── Game states ──────────────────────────────────────────────────────
@@ -845,13 +850,10 @@ def run():
         # ── Update ───────────────────────────────────────────────────
         if game_state == STATE_PLAY:
             if auto_mode:
-                # Trained policy still speaks the legacy turn/thrust API;
-                # drive it through the legacy physics path unchanged.
-                turn, thrust = autopilot.act(player, target)
-                physics.player_update(player, dt, turn, thrust)
-                # Visual rotor state for auto mode: both rotors lit together
-                left_power = float(thrust)
-                right_power = float(thrust)
+                # Trained policy outputs continuous left/right rotor throttles
+                # and drives the same power physics path the human uses.
+                left_power, right_power = autopilot.act(player, target)
+                physics.player_update_power(player, dt, left_power, right_power)
             else:
                 # Independent rotor control. Highest-power key wins per side.
                 left_power = 0.0
@@ -940,16 +942,10 @@ def run():
                 # AI pilot label
                 ai_label = font.render("AI PILOT  [P] manual", True, (255, 255, 100))
                 screen.blit(ai_label, (WIDTH // 2 - ai_label.get_width() // 2, 15))
-                # Show current action
-                actions = []
-                if turn == -1:
-                    actions.append("LEFT")
-                elif turn == 1:
-                    actions.append("RIGHT")
-                if thrust == 1:
-                    actions.append("THRUST")
-                act_str = " + ".join(actions) if actions else "COAST"
-                act_txt = font.render(act_str, True, WHITE)
+                # Show current rotor throttles
+                act_txt = font.render(
+                    f"L {left_power:.2f}   R {right_power:.2f}", True, WHITE
+                )
                 screen.blit(act_txt, (WIDTH // 2 - act_txt.get_width() // 2, 38))
                 draw_model_panel(screen, font, small_font, autopilot)
             else:

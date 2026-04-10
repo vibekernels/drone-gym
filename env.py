@@ -2,7 +2,10 @@
 
 Observation: stacked 1D camera frames → (num_frames, cam_width) float32 image
              + IMU aux vector (gyro_z, accel_forward, accel_lateral)
-Action:      MultiDiscrete([3, 2]) → (turn: left/none/right, thrust: off/on)
+Action:      Box([0,0], [1,1]) → (left_power, right_power) — independent
+             rotor throttles. Routed through physics.player_update_power so
+             the policy controls the same rigid-body model the human pilot
+             uses (and gets the angular-inertia rich dynamics).
 """
 
 import math
@@ -92,13 +95,22 @@ class DroneInterceptEnv:
         obs = self._get_obs()
         return obs
 
-    def step(self, action_turn, action_thrust):
-        """action_turn: 0=left, 1=none, 2=right.  action_thrust: 0=off, 1=on."""
+    def step(self, action_left, action_right):
+        """action_left, action_right: floats in [0, 1] — rotor throttles."""
         dt = 1.0 / 60.0
-        turn = action_turn - 1  # map 0,1,2 → -1,0,+1
-        thrust = action_thrust
+        # physics.player_update_power clamps internally, but be defensive.
+        lp = float(action_left)
+        rp = float(action_right)
+        if lp < 0.0:
+            lp = 0.0
+        elif lp > 1.0:
+            lp = 1.0
+        if rp < 0.0:
+            rp = 0.0
+        elif rp > 1.0:
+            rp = 1.0
 
-        physics.player_update(self.player, dt, turn, thrust)
+        physics.player_update_power(self.player, dt, lp, rp)
         physics.clamp_world(self.player, WORLD_H)
 
         self.target_phase += dt
@@ -248,15 +260,15 @@ class VecEnv:
         self.completed_lengths.clear()
         return self.obs_buf.copy(), self.aux_buf.copy()
 
-    def step(self, actions_turn, actions_thrust):
+    def step(self, actions_left, actions_right):
         """Step all environments. Auto-resets on done/truncated.
 
-        actions_turn:   (num_envs,) int array, values in {0, 1, 2}
-        actions_thrust: (num_envs,) int array, values in {0, 1}
+        actions_left:  (num_envs,) float array in [0, 1] — left rotor power
+        actions_right: (num_envs,) float array in [0, 1] — right rotor power
         """
         for i, env in enumerate(self.envs):
             obs, reward, done, truncated = env.step(
-                int(actions_turn[i]), int(actions_thrust[i])
+                float(actions_left[i]), float(actions_right[i])
             )
             self.obs_buf[i] = obs
             self.reward_buf[i] = reward

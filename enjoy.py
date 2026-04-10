@@ -69,9 +69,11 @@ def main():
         cam_t = torch.from_numpy(obs).unsqueeze(0).to(device)
         aux_t = torch.from_numpy(env.get_aux()).unsqueeze(0).to(device)
         with torch.no_grad():
-            a_turn, a_thrust, _, _, _ = policy.get_action_and_value(cam_t, aux_t)
+            a_left, a_right, _, _, _ = policy.get_action_and_value(cam_t, aux_t)
+        left_power = float(a_left.item())
+        right_power = float(a_right.item())
 
-        obs, reward, done, truncated = env.step(a_turn.item(), a_thrust.item())
+        obs, reward, done, truncated = env.step(left_power, right_power)
         score += reward
 
         if done:
@@ -82,7 +84,6 @@ def main():
 
         p = env.player
         t = env.target
-        thrust_on = (a_thrust.item() == 1)
 
         cam.update(p, t, dt)
 
@@ -92,7 +93,7 @@ def main():
         draw_ground(screen, cam)
 
         draw_drone(screen, t, (255, 60, 60), cam)
-        draw_drone(screen, p, (0, 180, 255), cam, thrust_on)
+        draw_drone(screen, p, (0, 180, 255), cam, left_power, right_power)
         draw_altimeter(screen, font, p[1])
         draw_speed(screen, font, p)
         draw_distance_indicator(screen, font, p, t)
@@ -104,16 +105,8 @@ def main():
         ai_label = font.render("AI PILOT", True, (255, 255, 100))
         screen.blit(ai_label, (WIDTH // 2 - ai_label.get_width() // 2, 15))
 
-        actions = []
-        turn_v = a_turn.item()
-        if turn_v == 0:
-            actions.append("LEFT")
-        elif turn_v == 2:
-            actions.append("RIGHT")
-        if a_thrust.item() == 1:
-            actions.append("THRUST")
-        act_str = " + ".join(actions) if actions else "COAST"
-        act_txt = font.render(act_str, True, WHITE)
+        act_txt = font.render(f"L {left_power:.2f}   R {right_power:.2f}",
+                              True, WHITE)
         screen.blit(act_txt, (WIDTH // 2 - act_txt.get_width() // 2, 40))
 
         pygame.display.flip()

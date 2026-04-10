@@ -10,6 +10,11 @@ PufferLib-inspired architecture:
 """
 
 import os
+# Beta.rsample/log_prob route through aten::_sample_dirichlet, which has no
+# MPS kernel as of torch 2.x. Fall back to CPU for that one op so the rest
+# of the policy/rollout still runs on the GPU.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 import sys
 import time
 import argparse
@@ -132,8 +137,8 @@ def train():
                           dtype=torch.float32)
     buf_aux = torch.zeros((args.horizon, args.num_envs, AUX_SIZE),
                           dtype=torch.float32)
-    buf_actions_turn = torch.zeros((args.horizon, args.num_envs), dtype=torch.long)
-    buf_actions_thrust = torch.zeros((args.horizon, args.num_envs), dtype=torch.long)
+    buf_actions_left = torch.zeros((args.horizon, args.num_envs), dtype=torch.float32)
+    buf_actions_right = torch.zeros((args.horizon, args.num_envs), dtype=torch.float32)
     buf_logprobs = torch.zeros((args.horizon, args.num_envs), dtype=torch.float32)
     buf_rewards = torch.zeros((args.horizon, args.num_envs), dtype=torch.float32)
     buf_dones = torch.zeros((args.horizon, args.num_envs), dtype=torch.float32)
@@ -158,20 +163,20 @@ def train():
             aux_t = torch.from_numpy(obs_aux).to(device)
 
             with torch.no_grad():
-                a_turn, a_thrust, logprob, _, value = policy.get_action_and_value(
+                a_left, a_right, logprob, _, value = policy.get_action_and_value(
                     cam_t, aux_t
                 )
 
             buf_cam[step] = cam_t.cpu()
             buf_aux[step] = aux_t.cpu()
-            buf_actions_turn[step] = a_turn.cpu()
-            buf_actions_thrust[step] = a_thrust.cpu()
+            buf_actions_left[step] = a_left.cpu()
+            buf_actions_right[step] = a_right.cpu()
             buf_logprobs[step] = logprob.cpu()
             buf_values[step] = value.cpu()
 
             # Step environments
             obs_cam, obs_aux, rewards, dones, truncs = vec_env.step(
-                a_turn.cpu().numpy(), a_thrust.cpu().numpy()
+                a_left.cpu().numpy(), a_right.cpu().numpy()
             )
 
             buf_rewards[step] = torch.from_numpy(rewards)
@@ -196,8 +201,8 @@ def train():
         # ── Flatten batches ──────────────────────────────────────────
         b_cam = buf_cam.reshape(-1, NUM_FRAMES, CAM_WIDTH)
         b_aux = buf_aux.reshape(-1, AUX_SIZE)
-        b_act_turn = buf_actions_turn.reshape(-1)
-        b_act_thrust = buf_actions_thrust.reshape(-1)
+        b_act_left = buf_actions_left.reshape(-1)
+        b_act_right = buf_actions_right.reshape(-1)
         b_logprobs = buf_logprobs.reshape(-1)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
@@ -219,8 +224,8 @@ def train():
 
                 mb_cam = b_cam[mb_idx].to(device)
                 mb_aux = b_aux[mb_idx].to(device)
-                mb_act_turn = b_act_turn[mb_idx].to(device)
-                mb_act_thrust = b_act_thrust[mb_idx].to(device)
+                mb_act_left = b_act_left[mb_idx].to(device)
+                mb_act_right = b_act_right[mb_idx].to(device)
                 mb_logprobs = b_logprobs[mb_idx].to(device)
                 mb_advantages = b_advantages[mb_idx].to(device)
                 mb_returns = b_returns[mb_idx].to(device)
@@ -231,7 +236,7 @@ def train():
 
                 # Forward pass with old actions
                 _, _, new_logprob, entropy, new_value = policy.get_action_and_value(
-                    mb_cam, mb_aux, mb_act_turn, mb_act_thrust
+                    mb_cam, mb_aux, mb_act_left, mb_act_right
                 )
 
                 # Policy loss (clipped)
