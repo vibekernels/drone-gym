@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.so
+*.c
+!setup.py
+build/
+*.egg-info/
+.venv/
