@@ -36,8 +36,9 @@ class DroneInterceptEnv:
     def __init__(self, seed=None):
         self.rng = random.Random(seed)
         # Pre-allocate Cython state arrays
-        self.player = array.array("d", [0.0] * 6)
-        self.target = array.array("d", [0.0] * 6)
+        # 7 elements: [x, y, vx, vy, angle, radius, omega]
+        self.player = array.array("d", [0.0] * 7)
+        self.target = array.array("d", [0.0] * 7)
         self.cam_out = array.array("d", [0.0, 0.0, 0.0])
         # Frame stack buffer
         self.frames = np.zeros((NUM_FRAMES, CAM_WIDTH), dtype=np.float32)

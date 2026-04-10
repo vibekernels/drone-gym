@@ -13,12 +13,21 @@ cdef double MAX_SPEED = 800.0      # legacy turn/thrust path speed cap
 # Power-based rotor path: tuned for small-FPV responsiveness
 # (~6.7:1 thrust-to-weight at full combined throttle, hover around 30%).
 cdef double PLAYER_THRUST_POWER = 2000.0   # max combined thrust (L=R=1.0)
-cdef double PLAYER_TURN_POWER = 8.0        # full-differential yaw rate (rad/s)
 cdef double MAX_SPEED_POWER = 1400.0       # power-path speed cap
 
+# Angular dynamics (rigid-body model, power path):
+#   dω/dt = YAW_ACCEL·(L - R) - YAW_DRAG·ω
+# With α=48 and β=6, full differential steady-state ω = 8 rad/s
+# (~458°/s, matching the previous instantaneous rate) and time
+# constant ≈ 0.167s — spin-up and spin-down feel snappy but not abrupt.
+cdef double YAW_ACCEL = 48.0     # rad/s² at full differential
+cdef double YAW_DRAG = 6.0       # angular drag rate (1/s)
+
 # ── Structs packed as C arrays for speed ─────────────────────────────
-# Drone state: [x, y, vx, vy, angle, radius]
-#               0  1   2   3    4      5
+# Drone state: [x, y, vx, vy, angle, radius, omega]
+#               0  1   2   3    4      5       6
+# Legacy turn/thrust player_update ignores index 6. The power path
+# reads and writes it so the drone has real angular inertia.
 
 cpdef void player_update(double[:] s, double dt, int turn, int thrust) noexcept:
     """Update player drone state in-place (legacy turn/thrust control).
@@ -77,11 +86,16 @@ cpdef void player_update_power(double[:] s, double dt,
     if right_power > 1.0:
         right_power = 1.0
 
-    # Differential torque: left rotor alone lifts the left side, pitching the
-    # body clockwise on screen (body-up tilts to the right). Right rotor alone
-    # does the opposite. In rigid-body terms, τ_z = -r·F_right + r·F_left, and
-    # in this coordinate system positive Δangle = clockwise, so:
-    s[4] += PLAYER_TURN_POWER * (left_power - right_power) * dt
+    # Rigid-body angular dynamics (semi-implicit Euler):
+    #   dω/dt = YAW_ACCEL·(L - R) - YAW_DRAG·ω
+    #   dθ/dt = ω
+    # Left rotor alone produces CW torque on screen (positive Δangle);
+    # right rotor alone produces CCW. The drone has real angular
+    # inertia — ω builds up under differential thrust and decays via
+    # aerodynamic drag when the sticks return to neutral.
+    cdef double ang_accel = YAW_ACCEL * (left_power - right_power) - YAW_DRAG * s[6]
+    s[6] += ang_accel * dt
+    s[4] += s[6] * dt
 
     # Combined thrust along body-up (angle 0 = up). L=R=1.0 → PLAYER_THRUST_POWER.
     cdef double thrust_mag = (left_power + right_power) * 0.5 * PLAYER_THRUST_POWER

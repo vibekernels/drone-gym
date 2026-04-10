@@ -39,13 +39,13 @@ THRUST_COL = (255, 160, 40)
 EXPLOSION_COLS = [(255, 255, 100), (255, 180, 50), (255, 80, 20), (200, 40, 10)]
 
 # ── Drone state indices ──────────────────────────────────────────────
-#  [x, y, vx, vy, angle, radius]
+#  [x, y, vx, vy, angle, radius, omega]
 PLAYER_RADIUS = 14.0
 TARGET_RADIUS = 18.0
 
 
 def make_state(x, y, radius):
-    return array.array("d", [x, y, 0.0, 0.0, 0.0, radius])
+    return array.array("d", [x, y, 0.0, 0.0, 0.0, radius, 0.0])
 
 
 # ── Dynamic camera ───────────────────────────────────────────────────
@@ -185,7 +185,10 @@ def draw_drone(surf, state, colour, cam, left_power=0.0, right_power=0.0):
     left_power / right_power: 0.0..1.0 — brightness/halo of each rotor
     scales with its power. 0 → thin idle ring.
     """
-    x, y, vx, vy, angle, radius = state
+    x = state[0]
+    y = state[1]
+    angle = state[4]
+    radius = state[5]
     sx, sy = cam.world_to_screen(x, y)
     r = cam.scale(radius)
 
@@ -793,6 +796,7 @@ def run():
         player[0] = WIDTH / 2
         player[1] = GROUND_Y - 30
         player[2] = player[3] = player[4] = 0.0
+        player[6] = 0.0  # angular velocity
         target_phase = random.uniform(0, 2 * math.pi)
         target_alt = random.uniform(80, 250)
         target_speed = random.uniform(120, 260)
