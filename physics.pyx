@@ -5,19 +5,29 @@ from libc.math cimport sin, cos, sqrt, atan2, M_PI, fabs
 
 # ── Constants ────────────────────────────────────────────────────────
 cdef double GRAVITY = 300.0        # px/s²  (downward)
-cdef double PLAYER_THRUST = 600.0  # px/s²
-cdef double PLAYER_TURN = 4.0      # rad/s
+cdef double PLAYER_THRUST = 600.0  # px/s²  (legacy turn/thrust path)
+cdef double PLAYER_TURN = 4.0      # rad/s  (legacy turn/thrust path)
 cdef double DRAG = 0.98            # per-frame velocity damping
-cdef double MAX_SPEED = 800.0
+cdef double MAX_SPEED = 800.0      # legacy turn/thrust path speed cap
+
+# Power-based rotor path: tuned for small-FPV responsiveness
+# (~6.7:1 thrust-to-weight at full combined throttle, hover around 30%).
+cdef double PLAYER_THRUST_POWER = 2000.0   # max combined thrust (L=R=1.0)
+cdef double PLAYER_TURN_POWER = 8.0        # full-differential yaw rate (rad/s)
+cdef double MAX_SPEED_POWER = 1400.0       # power-path speed cap
 
 # ── Structs packed as C arrays for speed ─────────────────────────────
 # Drone state: [x, y, vx, vy, angle, radius]
 #               0  1   2   3    4      5
 
 cpdef void player_update(double[:] s, double dt, int turn, int thrust) noexcept:
-    """Update player drone state in-place.
+    """Update player drone state in-place (legacy turn/thrust control).
     turn:  -1 left, 0 none, +1 right
     thrust: 1 if thrusting, else 0
+
+    Kept for backwards compatibility with the env and the trained policy
+    checkpoint. New code driving the drone with independent rotor powers
+    should call `player_update_power` instead.
     """
     # Rotation
     s[4] += PLAYER_TURN * turn * dt
@@ -39,6 +49,55 @@ cpdef void player_update(double[:] s, double dt, int turn, int thrust) noexcept:
     if speed > MAX_SPEED:
         s[2] = s[2] / speed * MAX_SPEED
         s[3] = s[3] / speed * MAX_SPEED
+
+    # Position
+    s[0] += s[2] * dt
+    s[1] += s[3] * dt
+
+
+cpdef void player_update_power(double[:] s, double dt,
+                               double left_power, double right_power) noexcept:
+    """Update player drone state in-place using independent rotor powers.
+
+    left_power, right_power: each in [0.0, 1.0]. Represents the fraction of
+    max rotor thrust each motor produces this step. Differential power
+    creates torque (rotation); combined power creates body-up thrust.
+
+    Tuned to feel like a small FPV quad: high thrust-to-weight so the
+    drone can hover around ~30% combined throttle and accelerate
+    aggressively, with a fast yaw rate from full differential.
+    """
+    # Clamp
+    if left_power < 0.0:
+        left_power = 0.0
+    if left_power > 1.0:
+        left_power = 1.0
+    if right_power < 0.0:
+        right_power = 0.0
+    if right_power > 1.0:
+        right_power = 1.0
+
+    # Differential torque: right > left → rotate right (positive angle = clockwise)
+    s[4] += PLAYER_TURN_POWER * (right_power - left_power) * dt
+
+    # Combined thrust along body-up (angle 0 = up). L=R=1.0 → PLAYER_THRUST_POWER.
+    cdef double thrust_mag = (left_power + right_power) * 0.5 * PLAYER_THRUST_POWER
+    if thrust_mag > 0.0:
+        s[2] += sin(s[4]) * thrust_mag * dt
+        s[3] -= cos(s[4]) * thrust_mag * dt
+
+    # Gravity
+    s[3] += GRAVITY * dt
+
+    # Drag
+    s[2] *= DRAG
+    s[3] *= DRAG
+
+    # Speed cap (higher than legacy — the power path is built for FPV speeds)
+    cdef double speed = sqrt(s[2] * s[2] + s[3] * s[3])
+    if speed > MAX_SPEED_POWER:
+        s[2] = s[2] / speed * MAX_SPEED_POWER
+        s[3] = s[3] / speed * MAX_SPEED_POWER
 
     # Position
     s[0] += s[2] * dt

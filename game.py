@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Drone Intercept 2D – Cython-accelerated arcade game.
 
-Pilot your interceptor drone (arrow keys / WASD) and smash into
-the enemy drone patrolling high above.
+Pilot your interceptor drone by throttling its two rotors independently
+(Q/A/Z for left rotor at 100/50/25%, E/D/C for right rotor) and smash
+into the enemy drone patrolling high above. Press P to toggle the
+trained AI pilot.
 """
 
 import os
@@ -109,8 +111,12 @@ def _rotated_poly(points, angle, cx, cy):
     return [(cx + x * ca - y * sa, cy + x * sa + y * ca) for x, y in points]
 
 
-def draw_drone(surf, state, colour, cam, thrust_on=False):
-    """Draw a drone as a stylised quad-copter shape."""
+def draw_drone(surf, state, colour, cam, left_power=0.0, right_power=0.0):
+    """Draw a drone as a stylised quad-copter shape.
+
+    left_power / right_power: 0.0..1.0 — brightness/halo of each rotor
+    scales with its power. 0 → thin idle ring.
+    """
     x, y, vx, vy, angle, radius = state
     sx, sy = cam.world_to_screen(x, y)
     r = cam.scale(radius)
@@ -122,24 +128,31 @@ def draw_drone(surf, state, colour, cam, thrust_on=False):
     pygame.draw.polygon(surf, colour, pts)
     pygame.draw.polygon(surf, WHITE, pts, 1)
 
-    # Arms + rotors
+    # Arms + rotors (left = side -1, right = side +1)
     rotor_radius = max(1, int(r * 0.35))
-    for side in (-1, 1):
+    rotor_powers = (left_power, right_power)
+    for idx, side in enumerate((-1, 1)):
+        power = max(0.0, min(1.0, float(rotor_powers[idx])))
         arm_end_x = side * r * 0.9
         arm_end_y = -r * 0.15
         arm = [(0, -r * 0.15), (arm_end_x, arm_end_y)]
         arm_pts = _rotated_poly(arm, angle, sx, sy)
         pygame.draw.line(surf, WHITE, arm_pts[0], arm_pts[1], max(1, int(2 * cam.zoom)))
-        # Rotor disc — filled bright when thrusting (spinning), thin outline when idle
         rotor_cx, rotor_cy = _rotated_poly([(arm_end_x, arm_end_y - r * 0.15)], angle, sx, sy)[0]
         rcx, rcy = int(rotor_cx), int(rotor_cy)
-        if thrust_on:
-            # Motion-blurred spin: filled disc with a faint outer halo
-            halo_r = rotor_radius + max(1, int(r * 0.1))
+        if power > 0.01:
+            # Motion-blurred spin: filled disc tinted toward THRUST_COL,
+            # with a soft outer halo whose alpha scales with power.
+            halo_r = rotor_radius + max(1, int(r * 0.1 * (0.5 + 0.5 * power)))
             halo = pygame.Surface((halo_r * 2 + 2, halo_r * 2 + 2), pygame.SRCALPHA)
-            pygame.draw.circle(halo, (*THRUST_COL, 70), (halo_r + 1, halo_r + 1), halo_r)
+            halo_alpha = int(30 + 70 * power)
+            pygame.draw.circle(halo, (*THRUST_COL, halo_alpha),
+                               (halo_r + 1, halo_r + 1), halo_r)
             surf.blit(halo, (rcx - halo_r - 1, rcy - halo_r - 1))
-            pygame.draw.circle(surf, THRUST_COL, (rcx, rcy), rotor_radius)
+            # Disc colour interpolates between drone body colour and THRUST_COL.
+            dc = tuple(int(colour[i] + (THRUST_COL[i] - colour[i]) * power)
+                       for i in range(3))
+            pygame.draw.circle(surf, dc, (rcx, rcy), rotor_radius)
             pygame.draw.circle(surf, WHITE, (rcx, rcy), rotor_radius, 1)
         else:
             pygame.draw.circle(surf, colour, (rcx, rcy), rotor_radius, 1)
@@ -664,7 +677,7 @@ def run():
             if ev.type == pygame.KEYDOWN:
                 if ev.key == pygame.K_ESCAPE:
                     running = False
-                if ev.key == pygame.K_c:
+                if ev.key == pygame.K_p:
                     if auto_mode:
                         auto_mode = False
                     elif autopilot.load():
@@ -686,18 +699,33 @@ def run():
         # ── Update ───────────────────────────────────────────────────
         if game_state == STATE_PLAY:
             if auto_mode:
+                # Trained policy still speaks the legacy turn/thrust API;
+                # drive it through the legacy physics path unchanged.
                 turn, thrust = autopilot.act(player, target)
+                physics.player_update(player, dt, turn, thrust)
+                # Visual rotor state for auto mode: both rotors lit together
+                left_power = float(thrust)
+                right_power = float(thrust)
             else:
-                turn = 0
-                thrust = 0
-                if keys[pygame.K_LEFT] or keys[pygame.K_a]:
-                    turn = -1
-                if keys[pygame.K_RIGHT] or keys[pygame.K_d]:
-                    turn = 1
-                if keys[pygame.K_UP] or keys[pygame.K_w]:
-                    thrust = 1
+                # Independent rotor control. Highest-power key wins per side.
+                left_power = 0.0
+                if keys[pygame.K_z]:
+                    left_power = 0.25
+                if keys[pygame.K_a]:
+                    left_power = 0.5
+                if keys[pygame.K_q]:
+                    left_power = 1.0
 
-            physics.player_update(player, dt, turn, thrust)
+                right_power = 0.0
+                if keys[pygame.K_c]:
+                    right_power = 0.25
+                if keys[pygame.K_d]:
+                    right_power = 0.5
+                if keys[pygame.K_e]:
+                    right_power = 1.0
+
+                physics.player_update_power(player, dt, left_power, right_power)
+
             physics.clamp_world(player, float(GROUND_Y))
 
             target_phase += dt
@@ -733,7 +761,8 @@ def run():
 
         if game_state == STATE_TITLE:
             title = big_font.render("DRONE INTERCEPT", True, WHITE)
-            sub = font.render("Arrow keys / WASD to fly.  [C] toggle AI pilot.", True, HUD_COL)
+            sub = font.render("Q/A/Z left rotor  E/D/C right rotor  [P] AI pilot",
+                              True, HUD_COL)
             start = font.render("Press SPACE to launch", True, (255, 255, 100))
             screen.blit(title, (WIDTH // 2 - title.get_width() // 2, HEIGHT // 2 - 60))
             screen.blit(sub, (WIDTH // 2 - sub.get_width() // 2, HEIGHT // 2))
@@ -746,12 +775,9 @@ def run():
                        (255, 60, 60), title_cam)
 
         elif game_state == STATE_PLAY:
-            if auto_mode:
-                thrust_on = (thrust == 1)
-            else:
-                thrust_on = keys[pygame.K_UP] or keys[pygame.K_w]
             draw_drone(screen, target, (255, 60, 60), cam)
-            draw_drone(screen, player, (0, 180, 255), cam, thrust_on)
+            draw_drone(screen, player, (0, 180, 255), cam,
+                       left_power, right_power)
             draw_altimeter(screen, font, player[1])
             draw_speed(screen, font, player)
             draw_distance_indicator(screen, font, player, target)
@@ -765,7 +791,7 @@ def run():
 
             if auto_mode:
                 # AI pilot label
-                ai_label = font.render("AI PILOT  [C] manual", True, (255, 255, 100))
+                ai_label = font.render("AI PILOT  [P] manual", True, (255, 255, 100))
                 screen.blit(ai_label, (WIDTH // 2 - ai_label.get_width() // 2, 15))
                 # Show current action
                 actions = []
@@ -780,7 +806,7 @@ def run():
                 screen.blit(act_txt, (WIDTH // 2 - act_txt.get_width() // 2, 38))
                 draw_model_panel(screen, font, small_font, autopilot)
             else:
-                mode_txt = font.render("[C] auto pilot", True, (100, 100, 100))
+                mode_txt = font.render("[P] auto pilot", True, (100, 100, 100))
                 screen.blit(mode_txt, (WIDTH // 2 - mode_txt.get_width() // 2, 15))
 
         elif game_state == STATE_HIT:
