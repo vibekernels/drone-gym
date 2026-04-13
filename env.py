@@ -1,7 +1,9 @@
 """Headless drone-intercept environment with vectorized batch support.
 
-Observation: stacked 1D camera frames → (num_frames, cam_width) float32 image
-             + IMU aux vector (gyro_z, accel_forward, accel_lateral)
+Observation: a single 1D camera line (cam_width,) float32 + IMU aux
+             vector (gyro_z, accel_forward, accel_lateral). Temporal
+             context is now the recurrent policy's job, not a stacked
+             frame buffer.
 Action:      Box([0,0], [1,1]) → (left_power, right_power) — independent
              rotor throttles. Routed through physics.player_update_power so
              the policy controls the same rigid-body model the human pilot
@@ -21,7 +23,6 @@ WORLD_W = 1024.0
 WORLD_H = 728.0       # ground Y (same as HEIGHT - 40)
 CAM_WIDTH = 64         # downsampled camera resolution
 CAM_FOV = math.pi / 2  # 90° field of view
-NUM_FRAMES = 4         # stacked frames for temporal info
 MAX_STEPS = 600        # 10 seconds at 60 fps
 PLAYER_RADIUS = 14.0
 TARGET_RADIUS = 18.0
@@ -43,8 +44,9 @@ class DroneInterceptEnv:
         self.player = array.array("d", [0.0] * 7)
         self.target = array.array("d", [0.0] * 7)
         self.cam_out = array.array("d", [0.0, 0.0, 0.0])
-        # Frame stack buffer
-        self.frames = np.zeros((NUM_FRAMES, CAM_WIDTH), dtype=np.float32)
+        # Observation is a single camera line — temporal context is
+        # the recurrent policy's responsibility now.
+        self.obs_line = np.zeros(CAM_WIDTH, dtype=np.float32)
         self.step_count = 0
         self.prev_dist = 0.0
         # IMU state tracking
@@ -90,7 +92,7 @@ class DroneInterceptEnv:
         self.prev_vx = 0.0
         self.prev_vy = 0.0
         self.prev_angle = 0.0
-        self.frames[:] = 0
+        self.obs_line[:] = 0
 
         obs = self._get_obs()
         return obs
@@ -150,10 +152,9 @@ class DroneInterceptEnv:
         obs = self._get_obs()
         return obs, reward, done, truncated
 
-    def _render_camera_line(self):
-        """Render a single 1D camera frame as float32 array in [0, 1]."""
-        line = np.zeros(CAM_WIDTH, dtype=np.float32)
-
+    def _render_camera_line(self, out):
+        """Render the current camera frame into `out` (CAM_WIDTH,) in [0, 1]."""
+        out[:] = 0
         physics.camera_project(self.player, self.target,
                                CAM_FOV, CAM_WIDTH, self.cam_out)
         centre = self.cam_out[0]
@@ -165,17 +166,12 @@ class DroneInterceptEnv:
             half_w = width / 2.0
             left = max(0, int(centre - half_w))
             right = min(CAM_WIDTH, int(centre + half_w) + 1)
-            line[left:right] = intensity
-
-        return line
+            out[left:right] = intensity
 
     def _get_obs(self):
-        """Return stacked camera frames (NUM_FRAMES, CAM_WIDTH)."""
-        new_line = self._render_camera_line()
-        # Shift stack and insert new frame
-        self.frames[:-1] = self.frames[1:]
-        self.frames[-1] = new_line
-        return self.frames.copy()
+        """Return a single-frame camera observation (CAM_WIDTH,) float32."""
+        self._render_camera_line(self.obs_line)
+        return self.obs_line.copy()
 
     def get_aux(self):
         """IMU sensor: (gyro_z, accel_forward, accel_lateral).
@@ -238,7 +234,7 @@ class VecEnv:
         self.envs = [DroneInterceptEnv(seed=seed + i) for i in range(num_envs)]
 
         # Pre-allocated output buffers
-        self.obs_buf = np.zeros((num_envs, NUM_FRAMES, CAM_WIDTH), dtype=np.float32)
+        self.obs_buf = np.zeros((num_envs, CAM_WIDTH), dtype=np.float32)
         self.aux_buf = np.zeros((num_envs, 3), dtype=np.float32)
         self.reward_buf = np.zeros(num_envs, dtype=np.float32)
         self.done_buf = np.zeros(num_envs, dtype=bool)

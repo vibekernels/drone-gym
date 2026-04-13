@@ -11,7 +11,7 @@ import torch
 import pygame
 
 import physics
-from env import DroneInterceptEnv, NUM_FRAMES, CAM_WIDTH, WORLD_W, WORLD_H
+from env import DroneInterceptEnv, CAM_WIDTH, WORLD_W, WORLD_H
 from policy import DronePolicy
 from game import (WIDTH, HEIGHT, GROUND_Y, FPS, WHITE, HUD_COL,
                   draw_gradient_sky, draw_stars, draw_ground, draw_drone,
@@ -47,6 +47,7 @@ def main():
     cam = Camera()
     env = DroneInterceptEnv(seed=0)
     obs = env.reset()
+    hidden = policy.initial_hidden(batch_size=1, device=device)
     score = 0
     hits = 0
 
@@ -62,6 +63,7 @@ def main():
                 running = False
             if ev.type == pygame.KEYDOWN and ev.key == pygame.K_r:
                 obs = env.reset()
+                hidden = policy.initial_hidden(batch_size=1, device=device)
                 score = 0
                 hits = 0
 
@@ -69,18 +71,18 @@ def main():
         cam_t = torch.from_numpy(obs).unsqueeze(0).to(device)
         aux_t = torch.from_numpy(env.get_aux()).unsqueeze(0).to(device)
         with torch.no_grad():
-            a_left, a_right, _, _, _ = policy.get_action_and_value(cam_t, aux_t)
+            a_left, a_right, _, _, _, hidden = policy.step(cam_t, aux_t, hidden)
         left_power = float(a_left.item())
         right_power = float(a_right.item())
 
         obs, reward, done, truncated = env.step(left_power, right_power)
         score += reward
 
-        if done:
-            hits += 1
+        if done or truncated:
+            if done:
+                hits += 1
             obs = env.reset()
-        elif truncated:
-            obs = env.reset()
+            hidden = policy.initial_hidden(batch_size=1, device=device)
 
         p = env.player
         t = env.target

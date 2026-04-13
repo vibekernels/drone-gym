@@ -18,11 +18,16 @@ import torch
 import pygame
 import physics  # Cython module
 from policy import DronePolicy
-from env import CAM_WIDTH as AI_CAM_WIDTH, CAM_FOV as AI_CAM_FOV, NUM_FRAMES, WORLD_H
+from env import CAM_WIDTH as AI_CAM_WIDTH, CAM_FOV as AI_CAM_FOV, WORLD_H
+
 
 # ── Display ──────────────────────────────────────────────────────────
 WIDTH, HEIGHT = 1024, 768
 FPS = 60
+# Physics runs at a fixed timestep regardless of the render framerate so
+# the trained (recurrent) policy sees the exact same dt it trained on.
+# Decoupled from render via an accumulator in the main loop.
+PHYSICS_DT = 1.0 / 60.0
 GROUND_Y = HEIGHT - 40
 
 # ── Colours ──────────────────────────────────────────────────────────
@@ -457,7 +462,7 @@ def draw_camera_view(surf, font, player, target):
 
 # ── Model I/O panel ──────────────────────────────────────────────────
 PANEL_W = 230
-PANEL_H = 360
+PANEL_H = 320
 PANEL_BG = (5, 5, 20, 210)
 PANEL_LABEL = (150, 200, 200)
 ROTOR_COL = (255, 160, 40)
@@ -495,36 +500,26 @@ def draw_model_panel(surf, font, small_font, autopilot):
 
     y = panel_y + 30
 
-    # ── Camera frame stack ───────────────────────────────────────────
-    label = small_font.render("CAMERA  (4 frames x 64 px)", True, PANEL_LABEL)
+    # ── Camera line ──────────────────────────────────────────────────
+    label = small_font.render("CAMERA  (64 px)", True, PANEL_LABEL)
     surf.blit(label, (panel_x + 10, y))
     y += 14
 
-    frames = autopilot.frames  # (4, 64)
+    line = autopilot.last_cam_line  # (64,)
     cell_w = 3
-    cell_h = 9
-    frame_gap = 2
+    cell_h = 16
     origin_x = panel_x + 10
-    bg_rect = pygame.Rect(origin_x - 1, y - 1,
-                          cell_w * 64 + 2, 4 * cell_h + 3 * frame_gap + 2)
+    bg_rect = pygame.Rect(origin_x - 1, y - 1, cell_w * 64 + 2, cell_h + 2)
     pygame.draw.rect(surf, (12, 12, 22), bg_rect)
-    # Row 0 is oldest, row 3 is newest
-    for i in range(4):
-        row_y = y + i * (cell_h + frame_gap)
-        for j in range(64):
-            v = float(frames[i, j])
-            if v > 0.02:
-                ic = max(40, min(255, int(v * 255)))
-                col = (ic, int(ic * 0.35), int(ic * 0.35))
-            else:
-                col = (22, 22, 32)
-            pygame.draw.rect(surf, col, (origin_x + j * cell_w, row_y, cell_w, cell_h))
-    # "newest" tick
-    tick_y = y + 3 * (cell_h + frame_gap) + cell_h + 1
-    pygame.draw.polygon(surf, HUD_COL,
-                        [(origin_x - 4, tick_y - 3), (origin_x - 4, tick_y + 3),
-                         (origin_x - 1, tick_y)])
-    y += 4 * cell_h + 3 * frame_gap + 8
+    for j in range(64):
+        v = float(line[j])
+        if v > 0.02:
+            ic = max(40, min(255, int(v * 255)))
+            col = (ic, int(ic * 0.35), int(ic * 0.35))
+        else:
+            col = (22, 22, 32)
+        pygame.draw.rect(surf, col, (origin_x + j * cell_w, y, cell_w, cell_h))
+    y += cell_h + 8
 
     # ── IMU ──────────────────────────────────────────────────────────
     label = small_font.render("IMU  (gyro / accel_fwd / accel_lat)", True, PANEL_LABEL)
@@ -633,18 +628,21 @@ CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 
 class Autopilot:
-    """Wraps the trained policy for use inside the game loop."""
+    """Wraps the trained recurrent policy for use inside the game loop."""
 
     GRAVITY = 300.0  # must match physics.pyx
 
     def __init__(self):
         self.policy = None
-        self.frames = np.zeros((NUM_FRAMES, AI_CAM_WIDTH), dtype=np.float32)
+        # Latest camera line — kept for the HUD panel only.
+        self.last_cam_line = np.zeros(AI_CAM_WIDTH, dtype=np.float32)
         self.cam_out = array.array("d", [0.0, 0.0, 0.0])
         # IMU state tracking
         self.prev_vx = 0.0
         self.prev_vy = 0.0
         self.prev_angle = 0.0
+        # Persistent GRU hidden state carried across `act()` calls.
+        self.hidden = None  # set in load() / reset()
         # Model I/O snapshots for visualization
         self.last_aux_vec = np.zeros(3, dtype=np.float32)
         # Continuous rotor outputs: Beta(α, β) per rotor + sampled action
@@ -665,10 +663,11 @@ class Autopilot:
         self.policy = DronePolicy()
         self.policy.load_state_dict(ckpt["policy"])
         self.policy.eval()
+        self.hidden = self.policy.initial_hidden(batch_size=1, device=torch.device("cpu"))
         return True
 
     def reset(self):
-        self.frames[:] = 0
+        self.last_cam_line[:] = 0
         self.prev_vx = 0.0
         self.prev_vy = 0.0
         self.prev_angle = 0.0
@@ -680,6 +679,8 @@ class Autopilot:
         self.last_left_action = 0.0
         self.last_right_action = 0.0
         self.last_value = 0.0
+        if self.policy is not None:
+            self.hidden = self.policy.initial_hidden(batch_size=1, device=torch.device("cpu"))
 
     def _render_camera_line(self, player, target):
         line = np.zeros(AI_CAM_WIDTH, dtype=np.float32)
@@ -724,17 +725,21 @@ class Autopilot:
     def act(self, player, target):
         """Return (left_power, right_power) — floats in [0, 1]."""
         new_line = self._render_camera_line(player, target)
-        self.frames[:-1] = self.frames[1:]
-        self.frames[-1] = new_line
+        self.last_cam_line = new_line
 
         aux = self._get_aux(player)
         self.last_aux_vec = aux.copy()
 
-        cam_t = torch.from_numpy(self.frames).unsqueeze(0)
-        aux_t = torch.from_numpy(aux).unsqueeze(0)
+        cam_t = torch.from_numpy(new_line).unsqueeze(0)   # (1, CAM_WIDTH)
+        aux_t = torch.from_numpy(aux).unsqueeze(0)        # (1, AUX_SIZE)
 
-        # Forward pass: extract Beta(α, β) per rotor + value for the HUD.
-        (alpha_l, beta_l), (alpha_r, beta_r), value = self.policy(cam_t, aux_t)
+        # Inline the policy's step so we can pull Beta(α, β) out for the HUD.
+        feat = self.policy._encode(cam_t, aux_t)                 # (1, H)
+        out, new_hidden = self.policy.gru(feat.unsqueeze(0), self.hidden)
+        out = out.squeeze(0)                                     # (1, H)
+        (alpha_l, beta_l), (alpha_r, beta_r), value = self.policy._heads(out)
+        self.hidden = new_hidden
+
         self.last_left_alpha = float(alpha_l.item())
         self.last_left_beta = float(beta_l.item())
         self.last_right_alpha = float(alpha_r.item())
@@ -796,8 +801,17 @@ def run():
     attempts = 0
     hit_timer = 0.0
 
+    # Fixed-timestep physics accumulator. Frame (render) dt is decoupled
+    # from physics dt so the recurrent policy always observes PHYSICS_DT
+    # between decisions.
+    physics_accum = 0.0
+    left_power = 0.0
+    right_power = 0.0
+
     def reset_round():
         nonlocal target_phase, target_alt, target_speed, patrol_left, patrol_right
+        nonlocal physics_accum
+        physics_accum = 0.0
         player[0] = WIDTH / 2
         player[1] = GROUND_Y - 30
         player[2] = player[3] = player[4] = 0.0
@@ -818,8 +832,10 @@ def run():
 
     running = True
     while running:
-        dt = clock.tick(FPS) / 1000.0
-        dt = min(dt, 0.05)  # prevent spiral-of-death
+        frame_dt = clock.tick(FPS) / 1000.0
+        # Cap catch-up budget so a long stall doesn't cause a thundering
+        # herd of physics steps on the next frame.
+        frame_dt = min(frame_dt, 0.1)
 
         # ── Events ───────────────────────────────────────────────────
         for ev in pygame.event.get():
@@ -849,58 +865,64 @@ def run():
 
         # ── Update ───────────────────────────────────────────────────
         if game_state == STATE_PLAY:
-            if auto_mode:
-                # Trained policy outputs continuous left/right rotor throttles
-                # and drives the same power physics path the human uses.
-                left_power, right_power = autopilot.act(player, target)
-                physics.player_update_power(player, dt, left_power, right_power)
-            else:
-                # Independent rotor control. Highest-power key wins per side.
-                left_power = 0.0
-                if keys[pygame.K_z]:
-                    left_power = 0.25
-                if keys[pygame.K_a]:
-                    left_power = 0.5
-                if keys[pygame.K_q]:
-                    left_power = 1.0
+            physics_accum += frame_dt
+            # Run as many fixed-dt physics ticks as are due this frame.
+            # Breaking out early on a hit is important so we don't step
+            # the drone through its own explosion.
+            while physics_accum >= PHYSICS_DT and game_state == STATE_PLAY:
+                physics_accum -= PHYSICS_DT
 
-                right_power = 0.0
-                if keys[pygame.K_c]:
-                    right_power = 0.25
-                if keys[pygame.K_d]:
-                    right_power = 0.5
-                if keys[pygame.K_e]:
-                    right_power = 1.0
+                if auto_mode:
+                    # Trained policy outputs continuous left/right rotor
+                    # throttles at a fixed 60 Hz and drives the same power
+                    # physics path the human uses.
+                    left_power, right_power = autopilot.act(player, target)
+                else:
+                    # Independent rotor control. Highest-power key wins per side.
+                    left_power = 0.0
+                    if keys[pygame.K_z]:
+                        left_power = 0.25
+                    if keys[pygame.K_a]:
+                        left_power = 0.5
+                    if keys[pygame.K_q]:
+                        left_power = 1.0
 
-                physics.player_update_power(player, dt, left_power, right_power)
+                    right_power = 0.0
+                    if keys[pygame.K_c]:
+                        right_power = 0.25
+                    if keys[pygame.K_d]:
+                        right_power = 0.5
+                    if keys[pygame.K_e]:
+                        right_power = 1.0
 
-            physics.clamp_world(player, float(GROUND_Y))
+                physics.player_update_power(player, PHYSICS_DT, left_power, right_power)
+                physics.clamp_world(player, float(GROUND_Y))
 
-            target_phase += dt
-            physics.target_update(target, dt, target_alt, target_speed,
-                                  patrol_left, patrol_right, target_phase)
+                target_phase += PHYSICS_DT
+                physics.target_update(target, PHYSICS_DT, target_alt, target_speed,
+                                      patrol_left, patrol_right, target_phase)
 
-            if physics.check_collision(player, target):
-                rel_spd = physics.relative_speed(player, target)
-                hit_score = int(rel_spd / 2)
-                score += hit_score
-                attempts += 1
-                # Spawn explosion
-                cx = (player[0] + target[0]) / 2
-                cy = (player[1] + target[1]) / 2
-                particles = [Particle(cx, cy) for _ in range(80)]
-                game_state = STATE_HIT
-                hit_timer = 0.0
+                if physics.check_collision(player, target):
+                    rel_spd = physics.relative_speed(player, target)
+                    hit_score = int(rel_spd / 2)
+                    score += hit_score
+                    attempts += 1
+                    # Spawn explosion
+                    cx = (player[0] + target[0]) / 2
+                    cy = (player[1] + target[1]) / 2
+                    particles = [Particle(cx, cy) for _ in range(80)]
+                    game_state = STATE_HIT
+                    hit_timer = 0.0
 
         elif game_state == STATE_HIT:
-            hit_timer += dt
+            hit_timer += frame_dt
             for p in particles:
-                p.update(dt)
+                p.update(frame_dt)
             particles = [p for p in particles if p.life > 0]
 
         # ── Update camera ────────────────────────────────────────────
         if game_state in (STATE_PLAY, STATE_HIT):
-            cam.update(player, target, dt)
+            cam.update(player, target, frame_dt)
 
         # ── Draw ─────────────────────────────────────────────────────
         screen.blit(sky_surf, (0, 0))

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""PPO training for the drone intercept game.
+"""Recurrent PPO training for the drone intercept game.
 
 PufferLib-inspired architecture:
   - Vectorized environments with shared numpy buffers
+  - GRU-backed policy carrying temporal state across env steps
   - Segment-based experience storage
   - GAE advantage estimation
   - Clipped PPO objective with value clipping
-  - Minibatch gradient updates
+  - Minibatches by env-sequence (not flat timesteps), so the GRU can
+    unroll in order while computing PPO losses
 """
 
 import os
@@ -32,14 +34,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from env import VecEnv, NUM_FRAMES, CAM_WIDTH
-from policy import DronePolicy, AUX_SIZE
+from env import VecEnv, CAM_WIDTH
+from policy import DronePolicy, AUX_SIZE, HIDDEN_SIZE
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train drone intercept agent with PPO")
     # Environment
-    p.add_argument("--num-envs", type=int, default=64)
+    p.add_argument("--num-envs", type=int, default=128)
     p.add_argument("--seed", type=int, default=42)
     # Rollout
     p.add_argument("--horizon", type=int, default=128,
@@ -47,7 +49,10 @@ def parse_args():
     # PPO
     p.add_argument("--epochs", type=int, default=4,
                    help="PPO epochs per rollout")
-    p.add_argument("--minibatch-size", type=int, default=512)
+    p.add_argument("--num-minibatches", type=int, default=8,
+                   help="Number of recurrent minibatches per epoch. "
+                        "Each minibatch is a group of whole env-sequences "
+                        "of length `horizon`, shuffled over env index.")
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--clip-coef", type=float, default=0.2)
@@ -109,12 +114,14 @@ def train():
     obs_cam, obs_aux = vec_env.reset()
 
     batch_size = args.num_envs * args.horizon
-    num_minibatches = max(1, batch_size // args.minibatch_size)
-    actual_minibatch_size = batch_size // num_minibatches
+    assert args.num_envs % args.num_minibatches == 0, (
+        "num_envs must be divisible by num_minibatches for recurrent PPO")
+    envs_per_mb = args.num_envs // args.num_minibatches
     num_updates = args.total_timesteps // batch_size
 
     print(f"Envs: {args.num_envs}  Horizon: {args.horizon}  "
-          f"Batch: {batch_size}  Minibatch: {actual_minibatch_size}")
+          f"Batch: {batch_size}  Minibatches: {args.num_minibatches}  "
+          f"Envs/mb: {envs_per_mb}")
     print(f"Total updates: {num_updates}  Total timesteps: {num_updates * batch_size}")
 
     # ── Policy & optimizer ───────────────────────────────────────────
@@ -133,7 +140,7 @@ def train():
         print(f"Resumed from {args.resume} at step {global_step}")
 
     # ── Rollout buffers (horizon, num_envs, ...) ─────────────────────
-    buf_cam = torch.zeros((args.horizon, args.num_envs, NUM_FRAMES, CAM_WIDTH),
+    buf_cam = torch.zeros((args.horizon, args.num_envs, CAM_WIDTH),
                           dtype=torch.float32)
     buf_aux = torch.zeros((args.horizon, args.num_envs, AUX_SIZE),
                           dtype=torch.float32)
@@ -144,17 +151,23 @@ def train():
     buf_dones = torch.zeros((args.horizon, args.num_envs), dtype=torch.float32)
     buf_values = torch.zeros((args.horizon, args.num_envs), dtype=torch.float32)
 
+    # Persistent GRU hidden state carried across rollouts.
+    next_hidden = policy.initial_hidden(args.num_envs, device)  # (1, N, H)
+
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     start_time = time.time()
 
     for update in range(start_update, num_updates):
-        update_start = time.time()
-
         # ── Learning rate annealing ──────────────────────────────────
         frac = 1.0 - update / num_updates
         lr_now = frac * args.lr
         for pg in optimizer.param_groups:
             pg["lr"] = lr_now
+
+        # Snapshot the hidden state at the *start* of this rollout — the
+        # PPO update needs it to replay the GRU unroll from the same
+        # initial condition the rollout used.
+        initial_hidden_snapshot = next_hidden.detach().clone()  # (1, N, H)
 
         # ── Collect rollout ──────────────────────────────────────────
         policy.eval()
@@ -163,8 +176,8 @@ def train():
             aux_t = torch.from_numpy(obs_aux).to(device)
 
             with torch.no_grad():
-                a_left, a_right, logprob, _, value = policy.get_action_and_value(
-                    cam_t, aux_t
+                a_left, a_right, logprob, _, value, next_hidden = policy.step(
+                    cam_t, aux_t, next_hidden
                 )
 
             buf_cam[step] = cam_t.cpu()
@@ -181,15 +194,27 @@ def train():
 
             buf_rewards[step] = torch.from_numpy(rewards)
             # For GAE, treat both terminal and truncated as episode boundaries
-            buf_dones[step] = torch.from_numpy(dones | truncs).float()
+            done_mask_np = dones | truncs
+            buf_dones[step] = torch.from_numpy(done_mask_np).float()
+
+            # Reset hidden state for envs that just terminated so step
+            # t+1 starts from a fresh zero state — matches the mask the
+            # PPO update will apply inside evaluate_sequence.
+            done_mask_t = torch.from_numpy(done_mask_np.astype(np.float32)).to(device)
+            next_hidden = next_hidden * (1.0 - done_mask_t).view(1, -1, 1)
 
             global_step += args.num_envs
 
-        # Bootstrap value for last step
+        # Bootstrap value for last step — uses next_hidden as it is,
+        # post-done-masking from the final step.
         with torch.no_grad():
             next_cam = torch.from_numpy(obs_cam).to(device)
             next_aux = torch.from_numpy(obs_aux).to(device)
-            _, _, _, _, next_value = policy.get_action_and_value(next_cam, next_aux)
+            # We don't want this call to advance next_hidden for the next
+            # rollout, so we run it on a throwaway copy.
+            _, _, _, _, next_value, _ = policy.step(
+                next_cam, next_aux, next_hidden
+            )
             next_value = next_value.cpu()
 
         # ── GAE ──────────────────────────────────────────────────────
@@ -198,46 +223,40 @@ def train():
             next_value, args.gamma, args.gae_lambda
         )
 
-        # ── Flatten batches ──────────────────────────────────────────
-        b_cam = buf_cam.reshape(-1, NUM_FRAMES, CAM_WIDTH)
-        b_aux = buf_aux.reshape(-1, AUX_SIZE)
-        b_act_left = buf_actions_left.reshape(-1)
-        b_act_right = buf_actions_right.reshape(-1)
-        b_logprobs = buf_logprobs.reshape(-1)
-        b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_values = buf_values.reshape(-1)
-
-        # ── PPO update epochs ────────────────────────────────────────
+        # ── PPO update: recurrent minibatches over envs ──────────────
         policy.train()
         clip_fracs = []
         total_pg_loss = 0.0
         total_v_loss = 0.0
         total_ent_loss = 0.0
+        approx_kl = torch.tensor(0.0)
 
         for epoch in range(args.epochs):
-            indices = torch.randperm(batch_size)
+            env_perm = torch.randperm(args.num_envs)
 
-            for start in range(0, batch_size, actual_minibatch_size):
-                end = start + actual_minibatch_size
-                mb_idx = indices[start:end]
+            for mb_start in range(0, args.num_envs, envs_per_mb):
+                mb_env_ids = env_perm[mb_start:mb_start + envs_per_mb]
 
-                mb_cam = b_cam[mb_idx].to(device)
-                mb_aux = b_aux[mb_idx].to(device)
-                mb_act_left = b_act_left[mb_idx].to(device)
-                mb_act_right = b_act_right[mb_idx].to(device)
-                mb_logprobs = b_logprobs[mb_idx].to(device)
-                mb_advantages = b_advantages[mb_idx].to(device)
-                mb_returns = b_returns[mb_idx].to(device)
-                mb_values = b_values[mb_idx].to(device)
+                mb_cam = buf_cam[:, mb_env_ids].to(device)              # (T, mb, W)
+                mb_aux = buf_aux[:, mb_env_ids].to(device)              # (T, mb, A)
+                mb_dones = buf_dones[:, mb_env_ids].to(device)          # (T, mb)
+                mb_act_left = buf_actions_left[:, mb_env_ids].to(device)
+                mb_act_right = buf_actions_right[:, mb_env_ids].to(device)
+                mb_logprobs = buf_logprobs[:, mb_env_ids].reshape(-1).to(device)
+                mb_values = buf_values[:, mb_env_ids].reshape(-1).to(device)
+                mb_advantages = advantages[:, mb_env_ids].reshape(-1).to(device)
+                mb_returns = returns[:, mb_env_ids].reshape(-1).to(device)
+                mb_h_init = initial_hidden_snapshot[:, mb_env_ids]       # (1, mb, H)
 
-                # Normalize advantages
+                # Normalize advantages (over the whole minibatch: T*mb)
                 mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
-                # Forward pass with old actions
-                _, _, new_logprob, entropy, new_value = policy.get_action_and_value(
-                    mb_cam, mb_aux, mb_act_left, mb_act_right
-                )
+                # Recurrent forward pass — unrolls the GRU through the
+                # full horizon for this minibatch's envs.
+                new_logprob, entropy, new_value = policy.evaluate_sequence(
+                    mb_cam, mb_aux, mb_dones, mb_h_init,
+                    mb_act_left, mb_act_right,
+                )  # all (T*mb,)
 
                 # Policy loss (clipped)
                 log_ratio = new_logprob - mb_logprobs
@@ -272,7 +291,7 @@ def train():
                 total_v_loss += v_loss.item()
                 total_ent_loss += ent_loss.item()
 
-        n_updates_done = args.epochs * num_minibatches
+        n_updates_done = args.epochs * args.num_minibatches
         avg_pg = total_pg_loss / n_updates_done
         avg_vl = total_v_loss / n_updates_done
         avg_ent = total_ent_loss / n_updates_done
