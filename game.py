@@ -14,10 +14,9 @@ import array
 import random
 
 import numpy as np
-import torch
 import pygame
 import physics  # Cython module
-from policy import DronePolicy
+from pn_controller import PNController, load_params
 from env import CAM_WIDTH as AI_CAM_WIDTH, CAM_FOV as AI_CAM_FOV, WORLD_H
 
 
@@ -25,7 +24,7 @@ from env import CAM_WIDTH as AI_CAM_WIDTH, CAM_FOV as AI_CAM_FOV, WORLD_H
 WIDTH, HEIGHT = 1024, 768
 FPS = 60
 # Physics runs at a fixed timestep regardless of the render framerate so
-# the trained (recurrent) policy sees the exact same dt it trained on.
+# the PN controller sees the exact same dt it was tuned for.
 # Decoupled from render via an accumulator in the main loop.
 PHYSICS_DT = 1.0 / 60.0
 GROUND_Y = HEIGHT - 40
@@ -486,7 +485,7 @@ def _draw_bipolar_bar(surf, x, y, w, h, value):
 
 
 def draw_model_panel(surf, font, small_font, autopilot):
-    """Live visualization of the policy's inputs and outputs."""
+    """Live visualization of PN controller inputs, guidance state, outputs."""
     panel_x = WIDTH - PANEL_W - 10
     panel_y = 100
 
@@ -495,7 +494,7 @@ def draw_model_panel(surf, font, small_font, autopilot):
     surf.blit(bg, (panel_x, panel_y))
     pygame.draw.rect(surf, HUD_COL, (panel_x, panel_y, PANEL_W, PANEL_H), 1)
 
-    title = font.render("MODEL I/O", True, HUD_COL)
+    title = font.render("PN GUIDANCE", True, HUD_COL)
     surf.blit(title, (panel_x + 10, panel_y + 6))
 
     y = panel_y + 30
@@ -543,51 +542,53 @@ def draw_model_panel(surf, font, small_font, autopilot):
                      (panel_x + 10, y), (panel_x + PANEL_W - 10, y), 1)
     y += 6
 
-    # ── ROTOR throttles (continuous Beta outputs) ────────────────────
-    label = small_font.render("ROTORS  (Beta α/β → throttle)", True, ROTOR_COL)
+    # ── Guidance state ───────────────────────────────────────────────
+    pn = autopilot.controller
+    guide_col = (180, 220, 255)
+
+    status = "SEARCH" if not pn.visible else ("TRACK" if pn.launched else "WAIT")
+    st_col = ((255, 255, 100) if status == "TRACK"
+              else (100, 100, 100) if status == "WAIT"
+              else (255, 130, 60))
+    st_txt = small_font.render(f"STATE: {status}", True, st_col)
+    surf.blit(st_txt, (panel_x + 10, y))
+    y += 16
+
+    info = [
+        ("bearing",  f"{math.degrees(pn.bearing):+6.1f} deg"),
+        ("LOS rate", f"{pn.los_rate:+6.2f} rad/s"),
+        ("range",    f"{pn.est_range:6.0f} px"),
+        ("hrc",      f"{pn.heading_rate_cmd:+6.2f} rad/s"),
+    ]
+    for lbl, val_s in info:
+        lt = small_font.render(lbl, True, (160, 160, 160))
+        vt = small_font.render(val_s, True, guide_col)
+        surf.blit(lt, (panel_x + 10, y))
+        surf.blit(vt, (panel_x + 80, y))
+        y += 13
+
+    y += 4
+    pygame.draw.line(surf, (50, 80, 80),
+                     (panel_x + 10, y), (panel_x + PANEL_W - 10, y), 1)
+    y += 6
+
+    # ── Rotor outputs ────────────────────────────────────────────────
+    label = small_font.render("ROTORS", True, ROTOR_COL)
     surf.blit(label, (panel_x + 10, y))
     y += 14
 
     max_bar = 150
-    rotor_data = (
-        ("L", autopilot.last_left_alpha, autopilot.last_left_beta,
-         autopilot.last_left_action),
-        ("R", autopilot.last_right_alpha, autopilot.last_right_beta,
-         autopilot.last_right_action),
-    )
-    for lbl, alpha, beta, sample in rotor_data:
+    for lbl, val in (("L", autopilot.last_left_action),
+                     ("R", autopilot.last_right_action)):
         lt = small_font.render(lbl, True, (200, 200, 200))
         surf.blit(lt, (panel_x + 12, y - 1))
         bx = panel_x + 30
-        # Background track
         pygame.draw.rect(surf, (30, 30, 40), (bx, y + 2, max_bar, bar_h))
-        # Distribution mean and std
-        ab_sum = max(1e-6, alpha + beta)
-        mean = alpha / ab_sum
-        var = (alpha * beta) / (ab_sum * ab_sum * (ab_sum + 1.0))
-        std = math.sqrt(max(0.0, var))
-        # Faint band: mean ± std (1-σ uncertainty)
-        lo = max(0.0, mean - std)
-        hi = min(1.0, mean + std)
-        band_x = bx + int(lo * max_bar)
-        band_w = max(1, int((hi - lo) * max_bar))
-        pygame.draw.rect(surf, ROTOR_DIM, (band_x, y + 2, band_w, bar_h))
-        # Solid bar up to the mean
-        pygame.draw.rect(surf, ROTOR_DIST, (bx, y + 2, int(mean * max_bar), bar_h))
-        # Sampled action: bright tick mark
-        sx = bx + int(max(0.0, min(1.0, sample)) * max_bar)
-        pygame.draw.line(surf, ROTOR_COL, (sx, y), (sx, y + bar_h + 4), 2)
-        pt = small_font.render(f"{int(sample * 100):3d}%", True, (220, 220, 220))
+        fill_w = int(max(0.0, min(1.0, val)) * max_bar)
+        pygame.draw.rect(surf, ROTOR_COL, (bx, y + 2, fill_w, bar_h))
+        pt = small_font.render(f"{int(val * 100):3d}%", True, (220, 220, 220))
         surf.blit(pt, (bx + max_bar + 6, y - 1))
         y += 14
-
-    y += 4
-
-    # ── Value estimate ───────────────────────────────────────────────
-    v_label = small_font.render("VALUE", True, VALUE_COL)
-    surf.blit(v_label, (panel_x + 10, y))
-    v_txt = font.render(f"{autopilot.last_value:+.2f}", True, VALUE_COL)
-    surf.blit(v_txt, (panel_x + 60, y - 3))
 
 
 # ── Particle explosion ──────────────────────────────────────────────
@@ -623,47 +624,37 @@ class Particle:
 
 # ── AI autopilot ─────────────────────────────────────────────────────
 
-CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               "checkpoints", "policy_final.pt")
+PARAMS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "pn_params.json")
 
 
 class Autopilot:
-    """Wraps the trained recurrent policy for use inside the game loop."""
+    """Wraps the PN guidance controller for use inside the game loop."""
 
     GRAVITY = 300.0  # must match physics.pyx
 
     def __init__(self):
-        self.policy = None
-        # Latest camera line — kept for the HUD panel only.
+        self.controller = PNController()
+        self.loaded = False
+        # Latest camera line — kept for the HUD panel.
         self.last_cam_line = np.zeros(AI_CAM_WIDTH, dtype=np.float32)
         self.cam_out = array.array("d", [0.0, 0.0, 0.0])
         # IMU state tracking
         self.prev_vx = 0.0
         self.prev_vy = 0.0
         self.prev_angle = 0.0
-        # Persistent GRU hidden state carried across `act()` calls.
-        self.hidden = None  # set in load() / reset()
-        # Model I/O snapshots for visualization
+        # HUD snapshots
         self.last_aux_vec = np.zeros(3, dtype=np.float32)
-        # Continuous rotor outputs: Beta(α, β) per rotor + sampled action
-        self.last_left_alpha = 1.0
-        self.last_left_beta = 1.0
-        self.last_right_alpha = 1.0
-        self.last_right_beta = 1.0
         self.last_left_action = 0.0
         self.last_right_action = 0.0
-        self.last_value = 0.0
 
     def load(self):
-        if self.policy is not None:
+        """Load tuned PN parameters (always succeeds — falls back to defaults)."""
+        if self.loaded:
             return True
-        if not os.path.exists(CHECKPOINT_PATH):
-            return False
-        ckpt = torch.load(CHECKPOINT_PATH, map_location="cpu", weights_only=False)
-        self.policy = DronePolicy()
-        self.policy.load_state_dict(ckpt["policy"])
-        self.policy.eval()
-        self.hidden = self.policy.initial_hidden(batch_size=1, device=torch.device("cpu"))
+        params = load_params(PARAMS_PATH)
+        self.controller = PNController(params)
+        self.loaded = True
         return True
 
     def reset(self):
@@ -672,15 +663,9 @@ class Autopilot:
         self.prev_vy = 0.0
         self.prev_angle = 0.0
         self.last_aux_vec[:] = 0.0
-        self.last_left_alpha = 1.0
-        self.last_left_beta = 1.0
-        self.last_right_alpha = 1.0
-        self.last_right_beta = 1.0
         self.last_left_action = 0.0
         self.last_right_action = 0.0
-        self.last_value = 0.0
-        if self.policy is not None:
-            self.hidden = self.policy.initial_hidden(batch_size=1, device=torch.device("cpu"))
+        self.controller.reset()
 
     def _render_camera_line(self, player, target):
         line = np.zeros(AI_CAM_WIDTH, dtype=np.float32)
@@ -721,7 +706,6 @@ class Autopilot:
         return np.array([gyro_z / 10.0, accel_fwd / 600.0, accel_lat / 600.0],
                         dtype=np.float32)
 
-    @torch.no_grad()
     def act(self, player, target):
         """Return (left_power, right_power) — floats in [0, 1]."""
         new_line = self._render_camera_line(player, target)
@@ -730,27 +714,7 @@ class Autopilot:
         aux = self._get_aux(player)
         self.last_aux_vec = aux.copy()
 
-        cam_t = torch.from_numpy(new_line).unsqueeze(0)   # (1, CAM_WIDTH)
-        aux_t = torch.from_numpy(aux).unsqueeze(0)        # (1, AUX_SIZE)
-
-        # Inline the policy's step so we can pull Beta(α, β) out for the HUD.
-        feat = self.policy._encode(cam_t, aux_t)                 # (1, H)
-        out, new_hidden = self.policy.gru(feat.unsqueeze(0), self.hidden)
-        out = out.squeeze(0)                                     # (1, H)
-        (alpha_l, beta_l), (alpha_r, beta_r), value = self.policy._heads(out)
-        self.hidden = new_hidden
-
-        self.last_left_alpha = float(alpha_l.item())
-        self.last_left_beta = float(beta_l.item())
-        self.last_right_alpha = float(alpha_r.item())
-        self.last_right_beta = float(beta_r.item())
-        self.last_value = float(value.item())
-
-        # Sample (matches training-time behaviour).
-        left_dist = torch.distributions.Beta(alpha_l, beta_l)
-        right_dist = torch.distributions.Beta(alpha_r, beta_r)
-        a_left = float(left_dist.sample().item())
-        a_right = float(right_dist.sample().item())
+        a_left, a_right = self.controller.act(new_line, aux)
 
         self.last_left_action = a_left
         self.last_right_action = a_right
@@ -802,7 +766,7 @@ def run():
     hit_timer = 0.0
 
     # Fixed-timestep physics accumulator. Frame (render) dt is decoupled
-    # from physics dt so the recurrent policy always observes PHYSICS_DT
+    # from physics dt so the PN controller always observes PHYSICS_DT
     # between decisions.
     physics_accum = 0.0
     left_power = 0.0
@@ -873,9 +837,8 @@ def run():
                 physics_accum -= PHYSICS_DT
 
                 if auto_mode:
-                    # Trained policy outputs continuous left/right rotor
-                    # throttles at a fixed 60 Hz and drives the same power
-                    # physics path the human uses.
+                    # PN controller outputs continuous left/right rotor
+                    # throttles at a fixed 60 Hz.
                     left_power, right_power = autopilot.act(player, target)
                 else:
                     # Independent rotor control. Highest-power key wins per side.

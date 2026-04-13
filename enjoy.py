@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Watch a trained policy play the game with the full pygame renderer."""
+"""Watch the PN guidance controller play the game with the full pygame renderer."""
 
 import sys
 import math
@@ -7,12 +7,11 @@ import array
 import argparse
 
 import numpy as np
-import torch
 import pygame
 
 import physics
 from env import DroneInterceptEnv, CAM_WIDTH, WORLD_W, WORLD_H
-from policy import DronePolicy
+from pn_controller import PNController, load_params
 from game import (WIDTH, HEIGHT, GROUND_Y, FPS, WHITE, HUD_COL,
                   draw_gradient_sky, draw_stars, draw_ground, draw_drone,
                   draw_altimeter, draw_speed, draw_distance_indicator,
@@ -23,19 +22,16 @@ import random
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("checkpoint", help="Path to .pt checkpoint")
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--params", default="pn_params.json",
+                        help="Path to PN parameters JSON")
     args = parser.parse_args()
 
-    device = torch.device(args.device)
-    policy = DronePolicy().to(device)
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    policy.load_state_dict(ckpt["policy"])
-    policy.eval()
+    params = load_params(args.params)
+    controller = PNController(params)
 
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption("Drone Intercept 2D – AI Agent")
+    pygame.display.set_caption("Drone Intercept 2D – PN Guidance")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("menlo", 18)
 
@@ -47,7 +43,6 @@ def main():
     cam = Camera()
     env = DroneInterceptEnv(seed=0)
     obs = env.reset()
-    hidden = policy.initial_hidden(batch_size=1, device=device)
     score = 0
     hits = 0
 
@@ -63,17 +58,13 @@ def main():
                 running = False
             if ev.type == pygame.KEYDOWN and ev.key == pygame.K_r:
                 obs = env.reset()
-                hidden = policy.initial_hidden(batch_size=1, device=device)
+                controller.reset()
                 score = 0
                 hits = 0
 
-        # Policy inference
-        cam_t = torch.from_numpy(obs).unsqueeze(0).to(device)
-        aux_t = torch.from_numpy(env.get_aux()).unsqueeze(0).to(device)
-        with torch.no_grad():
-            a_left, a_right, _, _, _, hidden = policy.step(cam_t, aux_t, hidden)
-        left_power = float(a_left.item())
-        right_power = float(a_right.item())
+        # PN controller inference
+        aux = env.get_aux()
+        left_power, right_power = controller.act(obs, aux)
 
         obs, reward, done, truncated = env.step(left_power, right_power)
         score += reward
@@ -82,7 +73,7 @@ def main():
             if done:
                 hits += 1
             obs = env.reset()
-            hidden = policy.initial_hidden(batch_size=1, device=device)
+            controller.reset()
 
         p = env.player
         t = env.target
@@ -104,11 +95,14 @@ def main():
         score_txt = font.render(f"SCORE {int(score)}  HITS {hits}", True, HUD_COL)
         screen.blit(score_txt, (WIDTH - score_txt.get_width() - 15, 15))
 
-        ai_label = font.render("AI PILOT", True, (255, 255, 100))
+        ai_label = font.render("PN GUIDANCE", True, (255, 255, 100))
         screen.blit(ai_label, (WIDTH // 2 - ai_label.get_width() // 2, 15))
 
-        act_txt = font.render(f"L {left_power:.2f}   R {right_power:.2f}",
-                              True, WHITE)
+        status = "TRACK" if controller.visible else ("WAIT" if not controller.launched else "SEARCH")
+        info = (f"L {left_power:.2f}  R {right_power:.2f}  "
+                f"brg {math.degrees(controller.bearing):+.1f}  "
+                f"rng {controller.est_range:.0f}  [{status}]")
+        act_txt = font.render(info, True, WHITE)
         screen.blit(act_txt, (WIDTH // 2 - act_txt.get_width() // 2, 40))
 
         pygame.display.flip()
